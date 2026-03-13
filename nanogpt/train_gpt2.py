@@ -19,9 +19,9 @@ from hellaswag import render_example, iterate_examples
 
 
 ENABLE_WANDB = True
-data_root = "edu_fineweb10B"
+data_root = "/home/martin/space/data/nanogpt/edu_fineweb10B"
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
 B = 64
 T = 1024 # sequence length
 
@@ -34,15 +34,37 @@ model_type = "gpt2"
 load_pretrained = False
 checkpoint_path = None
 
-project_name = "nano-gpt"
+project_name = "coupled-rms"
 run_name = f"ref"
 
 tokenizer = tiktoken.get_encoding("gpt2")
 
-with open('./wandb.txt', 'r') as file:
+with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
+impl = "coupled-rms" # "coupled-rms" "ref-rms"
+seed = 42
 # -----------------------------------------------------------------------------
+
+class RMSNormOutputScale(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.eps = 1e-5
+        self.weight = nn.Parameter(torch.ones(num_features,))
+
+    def forward(self, x):
+        var = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        scaler = torch.rsqrt(var)
+        x_norm = x * scaler 
+        return self.weight * x_norm, scaler
+
+class RMSNormInputScale(nn.Module):
+    def __init__(self, num_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_features,))
+
+    def forward(self, x, scaler):
+        return x * scaler * self.weight
 
 class CausalSelfAttention(nn.Module):
 
@@ -89,19 +111,39 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-class Block(nn.Module):
+if impl == "ref-rms":
 
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.mlp = MLP(config)
+    class Block(nn.Module):
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        def __init__(self, config):
+            super().__init__()
+            self.ln_1 = RMSNormOutputScale(config.n_embd)
+            self.attn = CausalSelfAttention(config)
+            self.ln_2 = RMSNormOutputScale(config.n_embd)
+            self.mlp = MLP(config)
+
+        def forward(self, x):
+            x = x + self.attn(self.ln_1(x)[0])
+            x = x + self.mlp(self.ln_2(x)[0])
+            return x
+
+if impl == "coupled-rms":
+
+    class Block(nn.Module):
+
+        def __init__(self, config):
+            super().__init__()
+            self.ln_1 = RMSNormOutputScale(config.n_embd)
+            self.attn = CausalSelfAttention(config)
+            self.ln_2 = RMSNormInputScale(config.n_embd)
+            self.mlp = MLP(config)
+
+        def forward(self, x):
+            x_n, ln_scale = self.ln_1(x)
+            x = x + self.attn(x_n)
+            x = x + self.mlp(self.ln_2(x, ln_scale))
+            return x
+
 
 @dataclass
 class GPTConfig:
@@ -121,7 +163,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = nn.LayerNorm(config.n_embd),
+            ln_f = RMSNormOutputScale(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -154,8 +196,8 @@ class GPT(nn.Module):
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
-        # forward the final layernorm and the classifier
-        x = self.transformer.ln_f(x)
+        # forward the final RMSNorm and the classifier
+        x = self.transformer.ln_f(x)[0]
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss, acc = None, None
         if targets is not None:
@@ -217,7 +259,7 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in self.named_parameters()}
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and RMSNorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -350,9 +392,9 @@ else:
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-torch.manual_seed(1337)
+torch.manual_seed(seed)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
+    torch.cuda.manual_seed(seed)
 
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -379,7 +421,7 @@ if checkpoint_path is not None:
     print(f"Load model from {checkpoint_path}. Continue at step {start_step}.")
 
 model.to(device)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
