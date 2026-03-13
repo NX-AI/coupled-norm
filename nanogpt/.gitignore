@@ -1,0 +1,11 @@
+wandb.txt
+hf
+.venv
+edu_fineweb10B
+hellaswag
+wandb
+*.pyc
+__pycache__
+*.log
+*.pt
+*.out
