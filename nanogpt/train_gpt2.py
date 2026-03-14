@@ -22,7 +22,7 @@ ENABLE_WANDB = True
 data_root = "/home/martin/space/data/nanogpt/edu_fineweb10B"
 
 total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
-B = 64
+B = 32
 T = 1024 # sequence length
 
 max_lr = 6e-4
@@ -43,28 +43,24 @@ with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
 impl = "coupled-rms" # "coupled-rms" "ref-rms"
-seed = 42
+seed = 67
 # -----------------------------------------------------------------------------
 
-class RMSNormOutputScale(nn.Module):
-    def __init__(self, num_features):
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, weight=None, eps = 1e-6):
         super().__init__()
-        self.eps = 1e-5
-        self.weight = nn.Parameter(torch.ones(num_features,))
+        self.weight = nn.Parameter(weight if weight is not None else torch.ones(hidden_size,))
+        self.eps = eps
 
-    def forward(self, x):
-        var = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        scaler = torch.rsqrt(var)
-        x_norm = x * scaler 
-        return self.weight * x_norm, scaler
+    def forward(self, x, scaler=None, return_scaler=False):
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        if scaler is None:
+            var = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+            scaler = torch.rsqrt(var)
 
-class RMSNormInputScale(nn.Module):
-    def __init__(self, num_features):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(num_features,))
-
-    def forward(self, x, scaler):
-        return x * scaler * self.weight
+        y = (self.weight * x * scaler).to(input_dtype)
+        return (y, scaler) if return_scaler else y
 
 class CausalSelfAttention(nn.Module):
 
@@ -114,34 +110,32 @@ class MLP(nn.Module):
 if impl == "ref-rms":
 
     class Block(nn.Module):
-
         def __init__(self, config):
             super().__init__()
-            self.ln_1 = RMSNormOutputScale(config.n_embd)
+            self.ln_1 = RMSNorm(config.n_embd)
             self.attn = CausalSelfAttention(config)
-            self.ln_2 = RMSNormOutputScale(config.n_embd)
+            self.ln_2 = RMSNorm(config.n_embd)
             self.mlp = MLP(config)
 
         def forward(self, x):
-            x = x + self.attn(self.ln_1(x)[0])
-            x = x + self.mlp(self.ln_2(x)[0])
+            x = x + self.attn(self.ln_1(x))
+            x = x + self.mlp(self.ln_2(x))
             return x
 
 if impl == "coupled-rms":
 
     class Block(nn.Module):
-
         def __init__(self, config):
             super().__init__()
-            self.ln_1 = RMSNormOutputScale(config.n_embd)
+            self.ln_1 = RMSNorm(config.n_embd)
             self.attn = CausalSelfAttention(config)
-            self.ln_2 = RMSNormInputScale(config.n_embd)
+            self.ln_2 = RMSNorm(config.n_embd)
             self.mlp = MLP(config)
 
         def forward(self, x):
-            x_n, ln_scale = self.ln_1(x)
+            x_n, ln_scale = self.ln_1(x, return_scaler=True)
             x = x + self.attn(x_n)
-            x = x + self.mlp(self.ln_2(x, ln_scale))
+            x = x + self.mlp(self.ln_2(x, scaler=ln_scale))
             return x
 
 
@@ -163,7 +157,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = RMSNormOutputScale(config.n_embd),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -197,7 +191,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x = block(x)
         # forward the final RMSNorm and the classifier
-        x = self.transformer.ln_f(x)[0]
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
         loss, acc = None, None
         if targets is not None:
