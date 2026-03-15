@@ -42,7 +42,7 @@ tokenizer = tiktoken.get_encoding("gpt2")
 with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
-impl = "coupled-rms" # "coupled-rms" "ref-rms"
+impl = "coupled-rms-bias" # "coupled-rms" "ref-rms" "coupled-rms-bias"
 seed = 67
 # -----------------------------------------------------------------------------
 
@@ -136,6 +136,23 @@ if impl == "coupled-rms":
             x_n, ln_scale = self.ln_1(x, return_scaler=True)
             x = x + self.attn(x_n)
             x = x + self.mlp(self.ln_2(x, scaler=ln_scale))
+            return x
+
+if impl == "coupled-rms-bias":
+
+    class Block(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.ln_1 = RMSNorm(config.n_embd)
+            self.attn = CausalSelfAttention(config)
+            self.ln_2 = RMSNorm(config.n_embd)
+            self.ln_bias = nn.Parameter(torch.ones((1,)))
+            self.mlp = MLP(config)
+
+        def forward(self, x):
+            x_n, ln_scale = self.ln_1(x, return_scaler=True)
+            x = x + self.attn(x_n)
+            x = x + self.mlp(self.ln_2(x, scaler=ln_scale * self.ln_bias))
             return x
 
 
