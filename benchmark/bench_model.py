@@ -26,12 +26,12 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x, scaler=None, return_scaler=False):
+        input_dtype = x.dtype
         if scaler is None:
-            input_dtype = x.dtype
             var = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True) + self.eps
-            scaler = torch.rsqrt(var).to(input_dtype)
+            scaler = torch.rsqrt(var)
 
-        y = self.weight * x * scaler
+        y = self.weight * (x * scaler).to(input_dtype)
         return (y, scaler) if return_scaler else y
 
 def patch_ref_model(model):
@@ -137,6 +137,8 @@ def benchmark_model(model_id, prompt, batch_size, new_tokens, cooldown_time=20, 
     print(f"REF/CoupledRMS: {t_ref:.3f}/{t_coupled:.3f} speedup={t_ref / t_coupled:.3f} rp={1 - t_coupled / t_ref:.3f} model={model_id} batch_size={batch_size} new_tokens={new_tokens} refref={refref:.3f}")
     print(f"REF/NoNorm    : {t_ref:.3f}/{t_no_norm:.3f} speedup={t_ref / t_no_norm:.3f} rp={1 - t_no_norm / t_ref:.3f} model={model_id} batch_size={batch_size} new_tokens={new_tokens} refref={refref:.3f}")
     print(f"REFREF={refref:.3f}")
+
+    results["speedup"] = t_ref / t_coupled
 
     return dict(results)
 
