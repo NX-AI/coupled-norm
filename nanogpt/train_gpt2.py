@@ -21,30 +21,37 @@ from hellaswag import render_example, iterate_examples
 ENABLE_WANDB = True
 data_root = "/home/martin/space/data/nanogpt/edu_fineweb10B"
 
-total_batch_size = 262144 # 2**19, ~0.5M, in number of tokens
+total_batch_size = 524288 # 262144 # 524288 # 262144 # 2**19, ~0.5M, in number of tokens
 B = 32
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715
+max_steps = 19073 # 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 model_type = "gpt2"
 load_pretrained = False
 checkpoint_path = None
 
 project_name = "coupled-rms"
-run_name = f"ref"
 
 tokenizer = tiktoken.get_encoding("gpt2")
 
 with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
-impl = "coupled-rms-bias" # "coupled-rms" "ref-rms" "coupled-rms-bias"
-seed = 67
+impl = "coupled-rms-bias" # "ref-rms" # "ref-rms" "coupled-rms-bias"
+
+coupled_has_bias = True
+coupled_normal_rms_before = 2
+
+seed = 8
+run_name = f"rms-mul-seed-{seed}-no-ln-0-{coupled_normal_rms_before-1}-full-data"
 # -----------------------------------------------------------------------------
+
+def get_scaler(x):
+    return (x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True) + 1e-6).rsqrt()
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, weight=None, eps = 1e-6):
@@ -99,7 +106,7 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.c_proj.NANOGPT_SCALE_INIT_MLP = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -110,7 +117,7 @@ class MLP(nn.Module):
 if impl == "ref-rms":
 
     class Block(nn.Module):
-        def __init__(self, config):
+        def __init__(self, config, idx):
             super().__init__()
             self.ln_1 = RMSNorm(config.n_embd)
             self.attn = CausalSelfAttention(config)
@@ -122,39 +129,30 @@ if impl == "ref-rms":
             x = x + self.mlp(self.ln_2(x))
             return x
 
-if impl == "coupled-rms":
-
-    class Block(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-            self.ln_1 = RMSNorm(config.n_embd)
-            self.attn = CausalSelfAttention(config)
-            self.ln_2 = RMSNorm(config.n_embd)
-            self.mlp = MLP(config)
-
-        def forward(self, x):
-            x_n, ln_scale = self.ln_1(x, return_scaler=True)
-            x = x + self.attn(x_n)
-            x = x + self.mlp(self.ln_2(x, scaler=ln_scale))
-            return x
-
 if impl == "coupled-rms-bias":
 
     class Block(nn.Module):
-        def __init__(self, config):
+        def __init__(self, config, idx):
             super().__init__()
+            self.idx = idx
             self.ln_1 = RMSNorm(config.n_embd)
             self.attn = CausalSelfAttention(config)
             self.ln_2 = RMSNorm(config.n_embd)
-            self.ln_bias = nn.Parameter(torch.ones((1,)))
+            self.ln_bias = nn.Parameter(torch.full((1,), fill_value=1.16))
             self.mlp = MLP(config)
 
         def forward(self, x):
-            x_n, ln_scale = self.ln_1(x, return_scaler=True)
-            x = x + self.attn(x_n)
-            x = x + self.mlp(self.ln_2(x, scaler=ln_scale * self.ln_bias))
+            if self.idx < coupled_normal_rms_before:
+                x = x + self.attn(self.ln_1(x))
+                x = x + self.mlp(self.ln_2(x))
+            else:
+                x_n, ln_scale = self.ln_1(x, return_scaler=True)
+                if coupled_has_bias:
+                    ln_scale = ln_scale * self.ln_bias
+    
+                x = x + self.attn(x_n)
+                x = x + self.mlp(self.ln_2(x, scaler=ln_scale))
             return x
-
 
 @dataclass
 class GPTConfig:
@@ -173,7 +171,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config, idx=i) for i in range(config.n_layer)]),
             ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -188,6 +186,8 @@ class GPT(nn.Module):
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+            if hasattr(module, 'NANOGPT_SCALE_INIT_MLP'):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -481,7 +481,9 @@ if master_process:
             "max_steps": max_steps,
             "total_batch_size": total_batch_size,
             "B": B,
-            "T": T
+            "T": T,
+            "seed": seed,
+            "impl": impl
         },
         mode=None if ENABLE_WANDB else "disabled"
     )
@@ -515,7 +517,7 @@ for step in range(start_step, max_steps):
 
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
-                checkpoint_path = f"model_{step:05d}.pt"
+                checkpoint_path = f"model_{run_name}_{step:05d}.pt"
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
