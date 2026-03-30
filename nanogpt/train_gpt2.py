@@ -3,6 +3,7 @@
 # unzip /workspace/vector-index-layer/nanogpt/fineweb.zip -d  /workspace/vector-index-layer/nanogpt/fineweb/
 
 import os
+from typing import OrderedDict
 os.environ["HF_HOME"] = "hf"
 
 import torch
@@ -17,6 +18,7 @@ from torch.nn import functional as F
 import tiktoken
 from hellaswag import render_example, iterate_examples
 
+torch._dynamo.config.capture_scalar_outputs = True
 
 ENABLE_WANDB = True
 data_root = "/home/martin/space/data/nanogpt/edu_fineweb10B"
@@ -28,11 +30,11 @@ T = 1024 # sequence length
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
-max_steps = 19073 # 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+max_steps = 19073 # 19073 # 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 model_type = "gpt2"
 load_pretrained = False
-checkpoint_path = None
+checkpoint_path = None # "/home/martin/space/coupled-rms-norm/nanogpt/model_ref-seed-8_19072.pt" # None
 
 project_name = "coupled-rms"
 
@@ -41,17 +43,17 @@ tokenizer = tiktoken.get_encoding("gpt2")
 with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
-impl = "coupled-rms-bias" # "ref-rms" # "ref-rms" "coupled-rms-bias"
+is_ref = True
 
-coupled_has_bias = True
+coupled_has_bias = False
 coupled_normal_rms_before = 2
 
-seed = 8
-run_name = f"rms-mul-seed-{seed}-no-ln-0-{coupled_normal_rms_before-1}-full-data"
-# -----------------------------------------------------------------------------
+if is_ref:
+    coupled_normal_rms_before = 42
 
-def get_scaler(x):
-    return (x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True) + 1e-6).rsqrt()
+seed = 8
+run_name = f"{'ref' if is_ref else "rms-mul"}-seed-{seed}-no-ln-0-{coupled_normal_rms_before-1}-full-data"
+# -----------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, weight=None, eps = 1e-6):
@@ -114,45 +116,66 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-if impl == "ref-rms":
 
-    class Block(nn.Module):
-        def __init__(self, config, idx):
-            super().__init__()
-            self.ln_1 = RMSNorm(config.n_embd)
-            self.attn = CausalSelfAttention(config)
-            self.ln_2 = RMSNorm(config.n_embd)
-            self.mlp = MLP(config)
+def rms(x):
+    return (x.detach().to(torch.float32).pow(2).mean(dim=-1) + 1e-6).sqrt().mean().item()
 
-        def forward(self, x):
-            x = x + self.attn(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return x
 
-if impl == "coupled-rms-bias":
+class Block(nn.Module):
+    def __init__(self, config, idx):
+        super().__init__()
+        self.idx = idx
+        self.ln_1 = RMSNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd)
+        self.ln_bias = nn.Parameter(torch.full((1,), fill_value=1.16)) if not is_ref else None
+        self.mlp = MLP(config)
+        self.log_meta = False
 
-    class Block(nn.Module):
-        def __init__(self, config, idx):
-            super().__init__()
-            self.idx = idx
-            self.ln_1 = RMSNorm(config.n_embd)
-            self.attn = CausalSelfAttention(config)
-            self.ln_2 = RMSNorm(config.n_embd)
-            self.ln_bias = nn.Parameter(torch.full((1,), fill_value=1.16))
-            self.mlp = MLP(config)
+    def forward(self, x):
+        x_pre_attn_norm = x
+        x_n, ln_scale = self.ln_1(x, return_scaler=True)
+        x_post_attn_norm = x_n
+        ln_scale_x_attn, ln_scale_x_mlp = ln_scale, ln_scale
 
-        def forward(self, x):
-            if self.idx < coupled_normal_rms_before:
-                x = x + self.attn(self.ln_1(x))
-                x = x + self.mlp(self.ln_2(x))
-            else:
-                x_n, ln_scale = self.ln_1(x, return_scaler=True)
-                if coupled_has_bias:
-                    ln_scale = ln_scale * self.ln_bias
-    
-                x = x + self.attn(x_n)
-                x = x + self.mlp(self.ln_2(x, scaler=ln_scale))
-            return x
+
+
+        if self.idx < coupled_normal_rms_before:
+            ln_scale = None
+        else:
+            if coupled_has_bias:
+                ln_scale = ln_scale * self.ln_bias
+                ln_scale_x_mlp = ln_scale_x_mlp * self.ln_bias
+
+        x_attn = self.attn(x_n)
+        x = x + x_attn
+
+        x_pre_mlp_norm = x
+        x_n = self.ln_2(x, scaler=ln_scale)
+        x_post_mlp_norm = x_n
+        x_mlp = self.mlp(x_n)
+        x = x + x_mlp
+        x_out = x
+
+        meta = {}
+
+        if self.log_meta:
+            meta = {
+                "rms_pre_attn_norm": rms(x_pre_attn_norm),
+                "rms_post_attn_norm": rms(x_post_attn_norm),
+                "rms_pre_mlp_norm": rms(x_pre_mlp_norm),
+                "rms_post_mlp_norm": rms(x_post_mlp_norm),
+                "rms_attn": rms(x_attn),
+                "rms_mlp": rms(x_mlp),
+                "rms_out": rms(x_out),
+                "norm_attn": rms(x_pre_attn_norm * ln_scale_x_attn),
+                "norm_mlp": rms(x_pre_mlp_norm * ln_scale_x_mlp),
+            }
+
+        if self.ln_bias is not None:
+            meta["ln_bias"] = self.ln_bias.detach().item()
+
+        return x, meta
 
 @dataclass
 class GPTConfig:
@@ -205,8 +228,12 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
         # forward the blocks of the transformer
-        for block in self.transformer.h:
-            x = block(x)
+        meta = {}
+        for i, block in enumerate(self.transformer.h):
+            x, block_meta = block(x)
+            for key in block_meta:
+                meta[f"l2/{i}/{key}"] = block_meta[key]
+
         # forward the final RMSNorm and the classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
@@ -214,7 +241,7 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             acc = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
-        return logits, loss, acc
+        return logits, loss, acc, meta
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -428,6 +455,7 @@ if checkpoint_path is not None:
     loaded = torch.load(checkpoint_path, weights_only=False)
     start_step = loaded["step"]
     model_checkpoint = loaded["model"]
+    model_checkpoint = OrderedDict((k.removeprefix('_orig_mod.'), v) for k, v in model_checkpoint.items())
     model.load_state_dict(model_checkpoint)
     print(f"Load model from {checkpoint_path}. Continue at step {start_step}.")
 
@@ -447,7 +475,7 @@ print(x.shape, y.shape)
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-    logits, loss, acc = model(x, y)
+    logits, loss, acc, _ = model(x, y)
 print(acc)
 
 
@@ -483,7 +511,8 @@ if master_process:
             "B": B,
             "T": T,
             "seed": seed,
-            "impl": impl
+            "is_ref": is_ref,
+            "coupled_normal_rms_before": coupled_normal_rms_before,
         },
         mode=None if ENABLE_WANDB else "disabled"
     )
@@ -493,9 +522,13 @@ for step in range(start_step, max_steps):
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 50 == 0 or last_step:
+    if step % 200 == 0 or last_step or step == 19080:
         model.eval()
         val_loader.reset()
+
+        for block in model.transformer.h:
+            block.log_meta = True
+
         with torch.no_grad():
             val_loss_accum, val_acc_accum = 0.0, 0.0
             val_loss_steps = 20
@@ -503,7 +536,7 @@ for step in range(start_step, max_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss, acc = model(x, y)
+                    logits, loss, acc, meta = model(x, y)
     
                 val_loss_accum += (loss / val_loss_steps).detach()
                 val_acc_accum += (acc / val_loss_steps).detach()
@@ -511,9 +544,13 @@ for step in range(start_step, max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             dist.all_reduce(val_acc_accum, op=dist.ReduceOp.AVG)
 
+        for block in model.transformer.h:
+            block.log_meta = False
+
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f} | acc: {val_acc_accum.item():.2f}")
-            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/acc": val_acc_accum.item()})
+            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/acc": val_acc_accum.item(), **meta})
+            print(meta)
 
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
@@ -548,7 +585,7 @@ for step in range(start_step, max_steps):
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _, __ = model(tokens)
+                    logits, _, __, ___ = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -581,7 +618,7 @@ for step in range(start_step, max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _, __ = model(xgen) # (B, T, vocab_size)
+                    logits, _, __, ___ = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :]# (B, vocab_size)
                 # get the probabilities
@@ -614,7 +651,7 @@ for step in range(start_step, max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss, acc = model(x, y)
+            logits, loss, acc, _ = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
