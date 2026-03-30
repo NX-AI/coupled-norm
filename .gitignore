@@ -5,3 +5,4 @@ benchmark/multirun
 benchmark/outputs
 *.out
 hf
+wandb

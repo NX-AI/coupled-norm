@@ -2,6 +2,11 @@
 # pip install transformers wandb tiktoken
 # unzip /workspace/vector-index-layer/nanogpt/fineweb.zip -d  /workspace/vector-index-layer/nanogpt/fineweb/
 
+# nanogpt refactors:
+# - Remove DPP
+# - Add hydra cxonfiguration
+# - Properly abstract additional wandb logs
+
 import os
 from typing import OrderedDict
 os.environ["HF_HOME"] = "hf"
@@ -43,16 +48,16 @@ tokenizer = tiktoken.get_encoding("gpt2")
 with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
     wandb_key = file.read()
 
-is_ref = True
+is_ref = False
 
 coupled_has_bias = False
-coupled_normal_rms_before = 2
-
-if is_ref:
-    coupled_normal_rms_before = 42
+normal_before = 2
+normal_after = 9
+fix_bias = 1.0
+learned_bias_initial = 1.05
 
 seed = 8
-run_name = f"{'ref' if is_ref else "rms-mul"}-seed-{seed}-no-ln-0-{coupled_normal_rms_before-1}-full-data"
+run_name = f"{'ref' if is_ref else "rms"}-s{seed}f-no-0_{normal_before}-{normal_after}_{11}"
 # -----------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
@@ -128,7 +133,7 @@ class Block(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
-        self.ln_bias = nn.Parameter(torch.full((1,), fill_value=1.16)) if not is_ref else None
+        self.ln_bias = nn.Parameter(torch.full((1,), fill_value=learned_bias_initial)) if not is_ref else None
         self.mlp = MLP(config)
         self.log_meta = False
 
@@ -138,11 +143,11 @@ class Block(nn.Module):
         x_post_attn_norm = x_n
         ln_scale_x_attn, ln_scale_x_mlp = ln_scale, ln_scale
 
-
-
-        if self.idx < coupled_normal_rms_before:
+        if is_ref or self.idx <= normal_before or self.idx >= normal_after:
+        # if self.idx < coupled_normal_rms_before:
             ln_scale = None
         else:
+            ln_scale = ln_scale * fix_bias
             if coupled_has_bias:
                 ln_scale = ln_scale * self.ln_bias
                 ln_scale_x_mlp = ln_scale_x_mlp * self.ln_bias
@@ -512,7 +517,11 @@ if master_process:
             "T": T,
             "seed": seed,
             "is_ref": is_ref,
-            "coupled_normal_rms_before": coupled_normal_rms_before,
+            "normal_before": normal_before,
+            "normal_after": normal_after,
+            "fix_bias": fix_bias,
+            "learned_bias_initial": learned_bias_initial,
+            "coupled_has_bias": coupled_has_bias
         },
         mode=None if ENABLE_WANDB else "disabled"
     )
@@ -522,7 +531,7 @@ for step in range(start_step, max_steps):
     last_step = (step == max_steps - 1)
 
     # once in a while evaluate our validation loss
-    if step % 200 == 0 or last_step or step == 19080:
+    if step % 50 == 0 or last_step or step == 19080:
         model.eval()
         val_loader.reset()
 
