@@ -11,6 +11,7 @@ import os
 from typing import OrderedDict
 os.environ["HF_HOME"] = "hf"
 
+import sys
 import torch
 import torch.nn as nn
 import math
@@ -25,8 +26,14 @@ from hellaswag import render_example, iterate_examples
 
 torch._dynamo.config.capture_scalar_outputs = True
 
-ENABLE_WANDB = True
-data_root = "/home/martin/space/data/nanogpt/edu_fineweb10B"
+def is_debugging():
+    return sys.gettrace() is not None
+
+DEBUG = is_debugging()
+print(f"Is debugging: {DEBUG}")
+
+ENABLE_WANDB = not DEBUG
+data_root = "edu_fineweb10B"
 
 total_batch_size = 524288 # 262144 # 524288 # 262144 # 2**19, ~0.5M, in number of tokens
 B = 32
@@ -45,19 +52,27 @@ project_name = "coupled-rms"
 
 tokenizer = tiktoken.get_encoding("gpt2")
 
-with open('/home/martin/space/data/nanogpt/wandb.txt', 'r') as file:
+with open('wandb.txt', 'r') as file:
     wandb_key = file.read()
 
 is_ref = False
 
 coupled_has_bias = False
+use_stat_mul_bias = True
 normal_before = 2
-normal_after = 9
-fix_bias = 1.0
+normal_after = 20
+normal_before_step = 1000
+fix_bias = 1.00
 learned_bias_initial = 1.05
 
+change_update_factor = 0.005
+
+fix_per_layer = [1.9606101512908936, 1.0616503953933716, 1.0016118288040161, 1.0992448329925537, 1.0188825130462646, 1.0434235334396362, 1.0728251934051514, 1.0478012561798096, 1.107548713684082, 1.095847249031067, 1.0957201719284058, 1.0121983289718628]
+
 seed = 8
-run_name = f"{'ref' if is_ref else "rms"}-s{seed}f-no-0_{normal_before}-{normal_after}_{11}"
+run_name = f"{'ref' if is_ref else "rms"}-s{seed}f-no-0_{normal_before}-{normal_after}_{11}-w{normal_before_step}"
+
+use_compile = not DEBUG
 # -----------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
@@ -125,62 +140,73 @@ class MLP(nn.Module):
 def rms(x):
     return (x.detach().to(torch.float32).pow(2).mean(dim=-1) + 1e-6).sqrt().mean().item()
 
+def rms_elementwise(x):
+    return (x.detach().to(torch.float32).pow(2).mean(dim=-1) + 1e-6).sqrt()
 
 class Block(nn.Module):
     def __init__(self, config, idx):
         super().__init__()
         self.idx = idx
+        self.step = 0
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
         self.ln_bias = nn.Parameter(torch.full((1,), fill_value=learned_bias_initial)) if not is_ref else None
         self.mlp = MLP(config)
+        self.register_buffer('norm_change', torch.full((1,), fill_value=1.0))
         self.log_meta = False
 
     def forward(self, x):
         x_pre_attn_norm = x
         x_n, ln_scale = self.ln_1(x, return_scaler=True)
-        x_post_attn_norm = x_n
-        ln_scale_x_attn, ln_scale_x_mlp = ln_scale, ln_scale
+        ln_scale_x_attn = ln_scale
 
-        if is_ref or self.idx <= normal_before or self.idx >= normal_after:
-        # if self.idx < coupled_normal_rms_before:
+        if is_ref or self.idx <= normal_before or self.idx >= normal_after or self.step < normal_before_step:
             ln_scale = None
         else:
-            ln_scale = ln_scale * fix_bias
+            if use_stat_mul_bias:
+                ln_scale = ln_scale * (1 / self.norm_change)
             if coupled_has_bias:
                 ln_scale = ln_scale * self.ln_bias
-                ln_scale_x_mlp = ln_scale_x_mlp * self.ln_bias
 
         x_attn = self.attn(x_n)
         x = x + x_attn
 
         x_pre_mlp_norm = x
         x_n = self.ln_2(x, scaler=ln_scale)
-        x_post_mlp_norm = x_n
         x_mlp = self.mlp(x_n)
         x = x + x_mlp
         x_out = x
 
+        self.norm_change = self.get_norm_change(x_pre_attn_norm, x_pre_mlp_norm)
+
         meta = {}
+
+        ln_scale_x_mlp = (ln_scale if ln_scale is not None else ln_scale_x_attn)
 
         if self.log_meta:
             meta = {
                 "rms_pre_attn_norm": rms(x_pre_attn_norm),
-                "rms_post_attn_norm": rms(x_post_attn_norm),
                 "rms_pre_mlp_norm": rms(x_pre_mlp_norm),
-                "rms_post_mlp_norm": rms(x_post_mlp_norm),
                 "rms_attn": rms(x_attn),
                 "rms_mlp": rms(x_mlp),
                 "rms_out": rms(x_out),
                 "norm_attn": rms(x_pre_attn_norm * ln_scale_x_attn),
                 "norm_mlp": rms(x_pre_mlp_norm * ln_scale_x_mlp),
+                "norm_change_mov_average": self.norm_change,
+                "norm_err": rms(x_pre_mlp_norm * ln_scale_x_mlp) - 1,
+                "norm_square_err": rms(rms_elementwise(x_pre_mlp_norm * ln_scale_x_mlp) - 1)
             }
 
         if self.ln_bias is not None:
             meta["ln_bias"] = self.ln_bias.detach().item()
 
         return x, meta
+
+    def get_norm_change(self, x_pre_attn, x_pre_mlp):
+        new_norm_change = (rms_elementwise(x_pre_mlp) / rms_elementwise(x_pre_attn)).mean()
+        return change_update_factor * new_norm_change + (1 - change_update_factor) * self.norm_change
+
 
 @dataclass
 class GPTConfig:
@@ -465,7 +491,6 @@ if checkpoint_path is not None:
     print(f"Load model from {checkpoint_path}. Continue at step {start_step}.")
 
 model.to(device)
-use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -529,6 +554,10 @@ if master_process:
 for step in range(start_step, max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
+
+    for block in model.transformer.h:
+        block.step = step
+
 
     # once in a while evaluate our validation loss
     if step % 50 == 0 or last_step or step == 19080:
