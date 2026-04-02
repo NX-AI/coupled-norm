@@ -1,17 +1,10 @@
-# sudo apt-get install unzip
-# pip install transformers wandb tiktoken
-# unzip /workspace/vector-index-layer/nanogpt/fineweb.zip -d  /workspace/vector-index-layer/nanogpt/fineweb/
 
-# nanogpt refactors:
-# - Remove DPP
-# - Add hydra cxonfiguration
-# - Properly abstract additional wandb logs
+# pip install transformers wandb tiktoken datasets hydra-core torch torchvision
 
 import os
 from typing import OrderedDict
-os.environ["HF_HOME"] = "hf"
-
 import sys
+from omegaconf import OmegaConf
 import torch
 import torch.nn as nn
 import math
@@ -21,85 +14,73 @@ import wandb
 import inspect
 from dataclasses import dataclass
 from torch.nn import functional as F
+import numpy as np
 import tiktoken
 from hellaswag import render_example, iterate_examples
+from hydra.core.config_store import ConfigStore
+from hydra import initialize, compose
+from pathlib import Path
 
-torch._dynamo.config.capture_scalar_outputs = True
+@dataclass
+class TrainConfig:
+    seed: int = 512
+    max_steps: int = 19073 # 19073 # 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+    warmup_steps: int = 715
+    total_batch_size: int = 524288 # 262144 # 524288 # 262144 # 2**19, ~0.5M, in number of tokens
+    max_lr: float = 6e-4
+    min_lr: float = 0.1 * 6e-4
+    B: int = 32
+    T: int = 1024 # sequence length
 
-def is_debugging():
-    return sys.gettrace() is not None
+    project_name: str = "coupled-rms"
+    model_type: str = "gpt2"
+    save_model_wandb: bool = False
+    save_model_local: bool = True
+    save_model_subfolder: str = "model"
+    load_pretrained: bool = False
+    checkpoint_path: str | None = None # "/home/martin/space/coupled-rms-norm/nanogpt/model_ref-seed-8_19072.pt" # None
 
-DEBUG = is_debugging()
-print(f"Is debugging: {DEBUG}")
+    is_ref: bool = False
+    coupled_has_bias: bool = False
+    use_stat_mul_bias: bool = False
+    normal_before: int = 2
+    normal_after: int = 20
+    normal_before_step: int = 1000
+    fix_bias: float = 1.00
+    learned_bias_initial: float = 1.05
+    stat_update_factor: float = 0.005
 
-ENABLE_WANDB = not DEBUG
-data_root = "edu_fineweb10B"
+cs = ConfigStore.instance()
+cs.store(name="base_config", node=TrainConfig)
 
-total_batch_size = 524288 # 262144 # 524288 # 262144 # 2**19, ~0.5M, in number of tokens
-B = 32
-T = 1024 # sequence length
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19073 # 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-
-model_type = "gpt2"
-load_pretrained = False
-checkpoint_path = None # "/home/martin/space/coupled-rms-norm/nanogpt/model_ref-seed-8_19072.pt" # None
-
-project_name = "coupled-rms"
-
-tokenizer = tiktoken.get_encoding("gpt2")
-
-with open('wandb.txt', 'r') as file:
-    wandb_key = file.read()
-
-is_ref = True
-
-coupled_has_bias = False
-use_stat_mul_bias = True
-normal_before = 2
-normal_after = 20
-normal_before_step = 1000
-fix_bias = 1.00
-learned_bias_initial = 1.05
-
-change_update_factor = 0.005
+with initialize(version_base=None):
+    cfg: TrainConfig = compose(config_name="base_config", overrides=sys.argv[1:])
 
 fix_per_layer = [1.9606101512908936, 1.0616503953933716, 1.0016118288040161, 1.0992448329925537, 1.0188825130462646, 1.0434235334396362, 1.0728251934051514, 1.0478012561798096, 1.107548713684082, 1.095847249031067, 1.0957201719284058, 1.0121983289718628]
 
-seed = 512
-run_name = f"{'ref' if is_ref else "rms"}-s{seed}f-no-0_{normal_before}-{normal_after}_{11}-w{normal_before_step}"
+if cfg.is_ref:
+    run_name = f"ref-s{cfg.seed}f"
+else:
+    run_name = f"rms-s{cfg.seed}f-no-0_{cfg.normal_before}-{cfg.normal_after}_{11}-w{cfg.normal_before_step}"
 
-use_compile = not DEBUG
-wandb_save_model = False
+tokenizer = tiktoken.get_encoding("gpt2")
 
-wandb_config = {
-    "is_ref": is_ref,
-    "normal_before": normal_before,
-    "normal_after": normal_after,
-    "fix_bias": fix_bias,
-    "learned_bias_initial": learned_bias_initial,
-    "coupled_has_bias": coupled_has_bias
-}
+dir = Path(__file__).parent
+with open(dir / 'wandb.txt', 'r') as file:
+    wandb_key = file.read()
+
+torch._dynamo.config.capture_scalar_outputs = True
+
+is_running_in_debugger = sys.gettrace() is not None
+
+ENABLE_WANDB = not is_running_in_debugger
+data_root = dir / "edu_fineweb10B"
+
+use_compile = not is_running_in_debugger
+
+wandb_config = OmegaConf.to_container(cfg, resolve=True)
+print(f"Config: {wandb_config}")
 # -----------------------------------------------------------------------------
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, weight=None, eps = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(weight if weight is not None else torch.ones(hidden_size,))
-        self.eps = eps
-
-    def forward(self, x, scaler=None, return_scaler=False):
-        input_dtype = x.dtype
-        x = x.to(torch.float32)
-        if scaler is None:
-            var = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
-            scaler = torch.rsqrt(var)
-
-        y = (self.weight * x * scaler).to(input_dtype)
-        return (y, scaler) if return_scaler else y
 
 class CausalSelfAttention(nn.Module):
 
@@ -146,6 +127,24 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# -----------------------------------------------------------------------------
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, weight=None, eps = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(weight if weight is not None else torch.ones(hidden_size,))
+        self.eps = eps
+
+    def forward(self, x, scaler=None, return_scaler=False):
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        if scaler is None:
+            var = x.pow(2).mean(dim=-1, keepdim=True) + self.eps
+            scaler = torch.rsqrt(var)
+
+        y = (self.weight * x * scaler).to(input_dtype)
+        return (y, scaler) if return_scaler else y
+
 
 def rms(x):
     return (x.detach().to(torch.float32).pow(2).mean(dim=-1) + 1e-6).sqrt().mean().item()
@@ -161,7 +160,7 @@ class Block(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = RMSNorm(config.n_embd)
-        self.ln_bias = nn.Parameter(torch.full((1,), fill_value=learned_bias_initial)) if not is_ref else None
+        self.ln_bias = nn.Parameter(torch.full((1,), fill_value=cfg.learned_bias_initial)) if not cfg.is_ref else None
         self.mlp = MLP(config)
         self.register_buffer('norm_change', torch.full((1,), fill_value=1.0))
         self.log_meta = False
@@ -171,12 +170,13 @@ class Block(nn.Module):
         x_n, ln_scale = self.ln_1(x, return_scaler=True)
         ln_scale_x_attn = ln_scale
 
-        if is_ref or self.idx <= normal_before or self.idx >= normal_after or self.step < normal_before_step:
+        if cfg.is_ref or self.idx <= cfg.normal_before or self.idx >= cfg.normal_after or self.step < cfg.normal_before_step:
             ln_scale = None
         else:
-            if use_stat_mul_bias:
+            ln_scale = ln_scale * cfg.fix_bias
+            if cfg.use_stat_mul_bias:
                 ln_scale = ln_scale * (1 / self.norm_change)
-            if coupled_has_bias:
+            if cfg.coupled_has_bias:
                 ln_scale = ln_scale * self.ln_bias
 
         x_attn = self.attn(x_n)
@@ -188,13 +188,13 @@ class Block(nn.Module):
         x = x + x_mlp
         x_out = x
 
-        self.norm_change = self.get_norm_change(x_pre_attn_norm, x_pre_mlp_norm)
+        if cfg.use_stat_mul_bias:
+            self.norm_change = self.get_norm_change(x_pre_attn_norm, x_pre_mlp_norm)
 
         meta = {}
-
-        ln_scale_x_mlp = (ln_scale if ln_scale is not None else ln_scale_x_attn)
-
         if self.log_meta:
+            ln_scale_x_mlp = (ln_scale if ln_scale is not None else ln_scale_x_attn)
+
             meta = {
                 "rms_pre_attn_norm": rms(x_pre_attn_norm),
                 "rms_pre_mlp_norm": rms(x_pre_mlp_norm),
@@ -208,14 +208,18 @@ class Block(nn.Module):
                 "norm_square_err": rms(rms_elementwise(x_pre_mlp_norm * ln_scale_x_mlp) - 1)
             }
 
-        if self.ln_bias is not None:
-            meta["ln_bias"] = self.ln_bias.detach().item()
+            if self.ln_bias is not None:
+                meta["ln_bias"] = self.ln_bias.detach().item()
+
+            meta = {f"l2/{self.idx}/{key}": value for key, value in meta.items()}
 
         return x, meta
 
     def get_norm_change(self, x_pre_attn, x_pre_mlp):
         new_norm_change = (rms_elementwise(x_pre_mlp) / rms_elementwise(x_pre_attn)).mean()
-        return change_update_factor * new_norm_change + (1 - change_update_factor) * self.norm_change
+        return cfg.stat_update_factor * new_norm_change + (1 - cfg.stat_update_factor) * self.norm_change
+
+# -----------------------------------------------------------------------------
 
 
 @dataclass
@@ -272,8 +276,7 @@ class GPT(nn.Module):
         meta = {}
         for i, block in enumerate(self.transformer.h):
             x, block_meta = block(x)
-            for key in block_meta:
-                meta[f"l2/{i}/{key}"] = block_meta[key]
+            meta = meta | block_meta
 
         # forward the final RMSNorm and the classifier
         x = self.transformer.ln_f(x)
@@ -357,8 +360,6 @@ class GPT(nn.Module):
         return optimizer
 
 # -----------------------------------------------------------------------------
-import tiktoken
-import numpy as np
 
 def load_tokens(filename):
     npt = np.load(filename)
@@ -443,33 +444,33 @@ print(f"using device: {device}")
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-torch.manual_seed(seed)
+torch.manual_seed(cfg.seed)
 if torch.cuda.is_available():
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed(cfg.seed)
 
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-print(f"total desired batch size: {total_batch_size}")
+assert cfg.total_batch_size % (cfg.B * cfg.T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = cfg.total_batch_size // (cfg.B * cfg.T * ddp_world_size)
+print(f"total desired batch size: {cfg.total_batch_size}")
 print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+train_loader = DataLoaderLite(B=cfg.B, T=cfg.T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+val_loader = DataLoaderLite(B=cfg.B, T=cfg.T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
 torch.set_float32_matmul_precision('high')
 
 # create model
 model = GPT(GPTConfig(vocab_size=50304))
-if load_pretrained:
-    model = GPT.from_pretrained(model_type) # or init from OpenAI GPT-2
+if cfg.load_pretrained:
+    model = GPT.from_pretrained(cfg.model_type) # or init from OpenAI GPT-2
 
 start_step = 0
-if checkpoint_path is not None:
-    loaded = torch.load(checkpoint_path, weights_only=False)
+if cfg.checkpoint_path is not None:
+    loaded = torch.load(cfg.checkpoint_path, weights_only=False)
     start_step = loaded["step"]
     model_checkpoint = loaded["model"]
     model_checkpoint = OrderedDict((k.removeprefix('_orig_mod.'), v) for k, v in model_checkpoint.items())
     model.load_state_dict(model_checkpoint)
-    print(f"Load model from {checkpoint_path}. Continue at step {start_step}.")
+    print(f"Load model from {cfg.checkpoint_path}. Continue at step {start_step}.")
 
 model.to(device)
 if use_compile:
@@ -491,16 +492,16 @@ print(acc)
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
+    if it < cfg.warmup_steps:
+        return cfg.max_lr * (it+1) / cfg.warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
+    if it > cfg.max_steps:
+        return cfg.min_lr
     # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    decay_ratio = (it - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
+    return cfg.min_lr + coeff * (cfg.max_lr - cfg.min_lr)
 
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
@@ -508,34 +509,17 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 
 wandb.login(key=wandb_key)
 model_artifact_name = f"{run_name}-model-{random.randint(0, 1000)}"
-run = wandb.init(
-    project=project_name,
-    name=run_name,
-    config={
-        "model_type": model_type,
-        "max_lr": max_lr,
-        "min_lr": min_lr,
-        "warmup_steps": warmup_steps,
-        "max_steps": max_steps,
-        "total_batch_size": total_batch_size,
-        "B": B,
-        "T": T,
-        "seed": seed,
-        **wandb_config
-    },
-    mode=None if ENABLE_WANDB else "disabled"
-)
+run = wandb.init(project=cfg.project_name, name=run_name, config=wandb_config, mode=None if ENABLE_WANDB else "disabled")
 
-for step in range(start_step, max_steps):
+for step in range(start_step, cfg.max_steps):
     t0 = time.time()
-    last_step = (step == max_steps - 1)
+    last_step = (step == cfg.max_steps - 1)
 
     for block in model.transformer.h:
         block.step = step
 
-
     # once in a while evaluate our validation loss
-    if step % 50 == 0 or last_step or step == 19080:
+    if step % 50 == 0 or last_step:
         model.eval()
         val_loader.reset()
 
@@ -563,25 +547,28 @@ for step in range(start_step, max_steps):
 
         if step > 0 and (step % 5000 == 0 or last_step):
             # optionally write model checkpoints
-            checkpoint_path = f"model_{run_name}_{step:05d}.pt"
-            checkpoint = {
-                'model': raw_model.state_dict(),
-                'config': raw_model.config,
-                'step': step,
-                'val_loss': val_loss_accum.item()
-            }
-            # you might also want to add optimizer.state_dict() and
-            # rng seeds etc., if you wanted to more exactly resume training
-            torch.save(checkpoint, checkpoint_path)
 
-            if wandb_save_model:
+            if cfg.save_model_local:
+                (dir / cfg.save_model_subfolder).mkdir(parents=True, exist_ok=True)
+                checkpoint_path = dir / cfg.save_model_subfolder / f"model_{run_name}_{step:05d}.pt"
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # you might also want to add optimizer.state_dict() and
+                # rng seeds etc., if you wanted to more exactly resume training
+                torch.save(checkpoint, checkpoint_path)
+
+            if cfg.save_model_wandb:
                 artifact = wandb.Artifact(name=model_artifact_name, type="model")
                 artifact.add_file(local_path=checkpoint_path)
                 run.log_artifact(artifact)
 
 
     # once in a while evaluate hellaswag
-    if (step % 100 == 0 or last_step) and (not use_compile):
+    if (step % 500 == 0 or last_step):
         num_correct_norm = 0
         num_total = 0
         for i, example in enumerate(iterate_examples("val")):
