@@ -164,13 +164,15 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.register_buffer('norm_change', torch.full((1,), fill_value=1.0))
         self.log_meta = False
+        self.step = 0
+        self.in_warmup = False
 
     def forward(self, x):
         x_pre_attn_norm = x
         x_n, ln_scale = self.ln_1(x, return_scaler=True)
         ln_scale_x_attn = ln_scale
 
-        if cfg.is_ref or self.idx <= cfg.normal_before or self.idx >= cfg.normal_after or self.step < cfg.normal_before_step:
+        if cfg.is_ref or self.idx <= cfg.normal_before or self.idx >= cfg.normal_after or self.in_warmup:
             ln_scale = None
         else:
             ln_scale = ln_scale * cfg.fix_bias
@@ -517,6 +519,7 @@ for step in range(start_step, cfg.max_steps):
 
     for block in model.transformer.h:
         block.step = step
+        block.in_warmup = step < cfg.normal_before_step 
 
     # once in a while evaluate our validation loss
     if step % 50 == 0 or last_step:
