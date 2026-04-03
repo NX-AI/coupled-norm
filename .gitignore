@@ -3,6 +3,8 @@
 __pycache__
 benchmark/multirun
 benchmark/outputs
+distill/model
+distill/output
 *.out
 hf
 wandb
