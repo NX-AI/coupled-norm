@@ -8,7 +8,8 @@ model:
   # For baseline: _component_: torchtune.models.llama3_2.lora_llama3_2_1b
   # For CoupledNorm: _component_: components.llama3_2_1B_coupled_rms.lora_llama3_2_1b
   _component_: null
-  lora_attn_modules: ['q_proj', 'v_proj', 'output_proj']
+  # We only add lora to the MLP's
+  lora_attn_modules: [] # ['q_proj', 'v_proj', 'output_proj']
   apply_lora_to_mlp: True
   apply_lora_to_output: False
   lora_rank: 64  # higher increases accuracy and memory

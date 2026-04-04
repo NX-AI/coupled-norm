@@ -447,6 +447,8 @@ print(f"using device: {device}")
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 torch.manual_seed(cfg.seed)
+random.seed(cfg.seed)
+np.random.seed(cfg.seed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(cfg.seed)
 

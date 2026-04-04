@@ -345,21 +345,36 @@ def lora_llama3_2(
     
     layers = nn.ModuleList()
     for i in range(num_layers):
-        self_attn = lora_llama3_2_self_attention(
-            lora_modules=lora_attn_modules,
-            pos_embeddings=rope,
-            head_dim=head_dim,
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            max_seq_len=max_seq_len,
-            attn_dropout=attn_dropout,
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            use_dora=use_dora,
-            quantize_base=quantize_base,
-        )
+        if len(lora_attn_modules) > 0:
+            self_attn = lora_llama3_2_self_attention(
+                lora_modules=lora_attn_modules,
+                pos_embeddings=rope,
+                head_dim=head_dim,
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                attn_dropout=attn_dropout,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                use_dora=use_dora,
+                quantize_base=quantize_base,
+            )
+        else:
+            self_attn = MultiHeadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
+                k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+                v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
+                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                pos_embeddings=rope,
+                max_seq_len=max_seq_len,
+                attn_dropout=attn_dropout,
+            )
 
         if apply_lora_to_mlp:
             mlp = lora_llama3_mlp(
