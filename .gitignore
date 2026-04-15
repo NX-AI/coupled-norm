@@ -8,3 +8,4 @@ distill/output
 *.out
 hf
 wandb
+tea_debug.log
