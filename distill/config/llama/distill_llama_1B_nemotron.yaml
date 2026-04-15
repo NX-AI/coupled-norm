@@ -1,0 +1,157 @@
+# Config for single device knowledge distillation (KD) in knowledge_distillation_single_device.py
+# using a LLAMA3 teacher and student model
+
+output_dir: output/distill/
+
+# Model Arguments
+model:
+  _component_: components.llama3_2_1B_coupled_rms.lora_llama3_2_1b 
+  norm_normal_before: 3
+  norm_normal_after: 100
+  # We only add lora to the MLP's
+  lora_attn_modules: [] # ['q_proj', 'v_proj', 'output_proj']
+  apply_lora_to_mlp: True
+  apply_lora_to_output: False
+  lora_rank: 128  # higher increases accuracy and memory
+  lora_alpha: 256  # usually alpha=2*rank
+  lora_dropout: 0.0
+  use_dora: True
+
+teacher_model:
+  _component_: torchtune.models.llama3_2.llama3_2_1b
+
+tokenizer:
+  _component_: torchtune.models.llama3.llama3_tokenizer
+  path: model/Llama-3.2-1B-Instruct/original/tokenizer.model
+  max_seq_len: 2048
+
+checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: model/Llama-3.2-1B-Instruct/
+  checkpoint_files: [
+    model.safetensors
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+resume_from_checkpoint: False
+save_adapter_weights_only: False
+
+teacher_checkpointer:
+  _component_: torchtune.training.FullModelHFCheckpointer
+  checkpoint_dir: model/Llama-3.2-1B-Instruct/
+  checkpoint_files: [
+    model.safetensors
+  ]
+  recipe_checkpoint: null
+  output_dir: ${output_dir}
+  model_type: LLAMA3
+
+dataset:
+  _component_: torchtune.datasets.chat_dataset
+  source: nvidia/Nemotron-Post-Training-Dataset-v2
+  conversation_column: messages
+  conversation_style: openai
+  train_on_input: False
+  packed: False
+  split: stem
+
+nix:
+  dataset:
+    - _component_: torchtune.datasets.chat_dataset
+      source: nvidia/Nemotron-Post-Training-Dataset-v2
+      conversation_column: messages
+      conversation_style: openai
+      train_on_input: False
+      packed: True
+      split: chat[:200000]
+    - _component_: torchtune.datasets.chat_dataset
+      source: nvidia/Nemotron-Post-Training-Dataset-v2
+      conversation_column: messages
+      conversation_style: openai
+      train_on_input: False
+      packed: True
+      split: math[:100000]
+    - _component_: torchtune.datasets.chat_dataset
+      source: nvidia/Nemotron-Post-Training-Dataset-v2
+      conversation_column: messages
+      conversation_style: openai
+      train_on_input: False
+      packed: True
+      split: stem[:100000]
+
+seed: 67
+shuffle: True
+batch_size: 4
+
+# Optimizer and Scheduler
+optimizer:
+  _component_: torch.optim.AdamW
+  fused: True
+  weight_decay: 0.01
+  lr: 3e-4
+lr_scheduler:
+  _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
+  num_warmup_steps: 250
+
+loss:
+  _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
+
+kd_loss:
+  _component_: torchtune.modules.loss.ForwardKLWithChunkedOutputLoss
+kd_ratio: 1.0
+
+# Training
+epochs: 1
+max_steps_per_epoch: null
+gradient_accumulation_steps: 8  # Use to increase effective batch size
+clip_grad_norm: null
+compile: True  # torch.compile the model + loss, True increases speed + decreases memory
+
+# Logging
+metric_logger:
+  _component_: torchtune.training.metric_logging.WandBLogger
+  project: coupled-rms-torchtune
+  log_dir: ${output_dir}/logs
+
+#metric_logger:
+#  _component_: torchtune.training.metric_logging.DiskLogger
+#  log_dir: ${output_dir}/logs
+
+log_every_n_steps: 1
+log_peak_memory_stats: True
+
+# Environment
+device: cuda
+dtype: bf16
+
+# Activations Memory
+enable_activation_checkpointing: False  # True reduces memory
+enable_activation_offloading: False  # True reduces memory
+
+
+
+# Profiler (disabled)
+profiler:
+  _component_: torchtune.training.setup_torch_profiler
+  enabled: False
+
+  #Output directory of trace artifacts
+  output_dir: ${output_dir}/profiling_outputs
+
+  #`torch.profiler.ProfilerActivity` types to trace
+  cpu: True
+  cuda: True
+
+  #trace options passed to `torch.profiler.profile`
+  profile_memory: False
+  with_stack: False
+  record_shapes: True
+  with_flops: False
+
+  # `torch.profiler.schedule` options:
+  # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
+  wait_steps: 5
+  warmup_steps: 3
+  active_steps: 2
+  num_cycles: 1

@@ -4,7 +4,8 @@ output_dir: ./ # Not needed
 
 # Model Arguments
 model:
-  _component_: null
+  _component_: components.llama3_2_1B_coupled_rms.llama3_2_1b 
+  norm_normal_before: 3
 
 # Checkpointer
 checkpointer:
@@ -22,7 +23,7 @@ resume_from_checkpoint: False
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
   path: model/Llama-3.2-1B-Instruct/original/tokenizer.model
-  max_seq_len: null
+  max_seq_len: 4096
 
 # Environment
 device: cuda
@@ -30,7 +31,7 @@ dtype: bf16
 seed: 1234 # It is not recommended to change this seed, b/c it matches EleutherAI's default seed
 
 # EleutherAI specific eval args
-tasks: ["truthfulqa_mc2", "hellaswag", "commonsense_qa"]
+tasks: ["hellaswag", "mmlu", "arc_challenge", "gpqa_main_zeroshot"]
 limit: null
 max_seq_length: 4096
 batch_size: 8

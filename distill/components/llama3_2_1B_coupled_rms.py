@@ -27,17 +27,44 @@ from torchtune.models.llama3_1._position_embeddings import Llama3ScaledRoPE
 from torchtune.modules import TiedLinear
 from torchtune.modules import MultiHeadAttention, TransformerDecoder
 from torchtune.modules import MultiHeadAttention
-from torchtune.models.llama3_2._component_builders import lora_llama3_2_self_attention, llama3_mlp, lora_llama3_mlp
+from torchtune.models.llama3_2._component_builders import lora_llama3_2_self_attention, llama3_mlp # , lora_llama3_mlp
 from torchtune.modules import TransformerDecoder
 from torchtune.modules.peft import LORA_ATTN_MODULES
 from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
+from torchtune.modules import FeedForward
+from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
 
+
+def setup_caches(
+    self,
+    batch_size: int,
+    dtype: torch.dtype,
+    *,
+    encoder_max_seq_len: Optional[int] = None,
+    decoder_max_seq_len: Optional[int] = None,
+):
+    has_decoder_layers = True
+    if has_decoder_layers:
+        if decoder_max_seq_len is not None:
+            self.decoder_max_cache_seq_len = decoder_max_seq_len
+        else:
+            self.decoder_max_cache_seq_len = self.max_seq_len
+    for layer in self.layers:
+        layer.setup_caches(
+            batch_size,
+            dtype,
+            encoder_max_seq_len=self.encoder_max_cache_seq_len,
+            decoder_max_seq_len=self.decoder_max_cache_seq_len,
+        )
+# Mokey patch, because original implementaion checks for class that we've redefined
+TransformerDecoder.setup_caches = setup_caches
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, unfreeze = True) -> None:
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
+        self.unfreeze = unfreeze
 
     def forward(self, x, scaler=None, return_scaler=False):
         input_dtype = x.dtype
@@ -47,6 +74,12 @@ class RMSNorm(nn.Module):
 
         y = (self.scale * x * scaler).to(input_dtype)
         return (y, scaler) if return_scaler else y
+
+    # Make RMSNorm weight learnable
+    def adapter_params(self) -> List[str]:
+        if not self.unfreeze: return []
+        adapter_params = ["scale"]
+        return adapter_params
 
 
 class TransformerSelfAttentionLayer(nn.Module):
@@ -73,10 +106,12 @@ class TransformerSelfAttentionLayer(nn.Module):
         sa_scale: Optional[nn.Module] = None,
         mlp_scale: Optional[nn.Module] = None,
         norm_normal_before: int | None = None,
+        norm_normal_after: int | None = None,
     ) -> None:
         super().__init__()
         self.idx = idx
         self.norm_normal_before = norm_normal_before
+        self.norm_normal_after = norm_normal_after
         self.attn = attn
         self.mlp = mlp
         self.sa_norm = sa_norm or nn.Identity()
@@ -162,8 +197,12 @@ class TransformerSelfAttentionLayer(nn.Module):
         h, attn_scaler = self.sa_norm(x, return_scaler=True)
         attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
 
-        if self.norm_normal_before is not None and self.idx <= self.norm_normal_before:
+        # fix_scalers = [0.845, 0.817, 0.857, 0.892, 0.93, 0.933, 0.939, 0.916, 0.923, 0.875, 0.971, 0.907, 0.915, 0.91, 0.871, 0.925]
+
+        if self.norm_normal_before is not None and (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):
             attn_scaler = None
+        else:
+            attn_scaler = attn_scaler * 0.9
 
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = self.sa_scale(attn_out) + x
@@ -190,6 +229,7 @@ def llama3_2(
     scale_factor: int = 32,
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Build the decoder associated with the Llama3.2 model. This includes:
@@ -245,9 +285,10 @@ def llama3_2(
         layer = TransformerSelfAttentionLayer(
             idx=i,
             norm_normal_before=norm_normal_before,
+            norm_normal_after=norm_normal_after,
             attn=self_attn,
             mlp=mlp,
-            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
             mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
         )
         layers.append(layer)
@@ -264,9 +305,58 @@ def llama3_2(
         max_seq_len=max_seq_len,
         num_heads=num_heads,
         head_dim=head_dim,
-        norm=RMSNorm(embed_dim, eps=norm_eps),
+        norm=RMSNorm(embed_dim, eps=norm_eps, unfreeze=False),
         output=output_proj,
     )
+
+def lora_llama3_mlp(
+    *,
+    dim: int,
+    hidden_dim: int,
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+) -> FeedForward:
+    adapter_cls = DoRALinear if use_dora else LoRALinear
+    gate_proj = adapter_cls(
+        in_dim=dim,
+        out_dim=hidden_dim,
+        rank=lora_rank,
+        alpha=lora_alpha,
+        dropout=lora_dropout,
+        quantize_base=quantize_base,
+    )
+    # gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    down_proj = adapter_cls(
+        in_dim=hidden_dim,
+        out_dim=dim,
+        rank=lora_rank,
+        alpha=lora_alpha,
+        dropout=lora_dropout,
+        quantize_base=quantize_base,
+    )
+
+    down_proj = nn.Linear(hidden_dim, dim, bias=False)
+
+    up_proj = adapter_cls(
+        in_dim=dim,
+        out_dim=hidden_dim,
+        rank=lora_rank,
+        alpha=lora_alpha,
+        dropout=lora_dropout,
+        quantize_base=quantize_base,
+    )
+
+    # up_proj = nn.Linear(dim, hidden_dim, bias=False)
+    return FeedForward(
+        gate_proj=gate_proj,
+        down_proj=down_proj,
+        up_proj=up_proj,
+    )
+
 
 
 def lora_llama3_2(
@@ -295,6 +385,7 @@ def lora_llama3_2(
     quantize_base: bool = False,
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Return a version of Llama3.2 (an instance of :func:`~torchtune.modules.TransformerDecoder`)
@@ -376,7 +467,10 @@ def lora_llama3_2(
                 attn_dropout=attn_dropout,
             )
 
-        if apply_lora_to_mlp:
+        norm_normal_before_fixed_for_baseline = 3
+        # TODO: Baseline script currently broken, we still need to apply lora to the MLP layers
+
+        if apply_lora_to_mlp and i > norm_normal_before and i < norm_normal_after:
             mlp = lora_llama3_mlp(
                 dim=embed_dim,
                 hidden_dim=hidden_dim,
@@ -389,16 +483,19 @@ def lora_llama3_2(
         else:
             mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
 
+        # mlp = llama3_mlp_finetune(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
+
         layer = TransformerSelfAttentionLayer(
             idx=i,
             norm_normal_before=norm_normal_before,
+            norm_normal_after=norm_normal_after,
             attn=self_attn,
             mlp=mlp,
-            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
+            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after),
         )
         layers.append(layer)
-        
+
     tok_embeddings = nn.Embedding(vocab_size, embed_dim)
 
     if apply_lora_to_output:
@@ -417,7 +514,7 @@ def lora_llama3_2(
         max_seq_len=max_seq_len,
         num_heads=num_heads,
         head_dim=(embed_dim // num_heads),
-        norm=RMSNorm(embed_dim, eps=norm_eps),
+        norm=RMSNorm(embed_dim, eps=norm_eps, unfreeze=False),
         output=output_proj,
     )
 
@@ -438,7 +535,8 @@ Llama3.2 1B model.
 """
 def llama3_2_1b(
     tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 model initialized w/ the default 1b parameter values.
@@ -462,12 +560,14 @@ def llama3_2_1b(
         rope_base=500_000,
         scale_factor=32,
         tie_word_embeddings=tie_word_embeddings,
-        norm_normal_before=norm_normal_before
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
     )
 
 def llama3_2_3b(
     tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 model initialized w/ the default 3b parameter values.
@@ -492,6 +592,7 @@ def llama3_2_3b(
         scale_factor=32,
         tie_word_embeddings=tie_word_embeddings,
         norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after
     )
 
 def lora_llama3_2_1b(
@@ -504,7 +605,8 @@ def lora_llama3_2_1b(
     use_dora: bool = False,
     quantize_base: bool = False,
     tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 1B model with LoRA enabled.
@@ -552,7 +654,8 @@ def lora_llama3_2_1b(
         use_dora=use_dora,
         quantize_base=quantize_base,
         tie_word_embeddings=tie_word_embeddings,
-        norm_normal_before=norm_normal_before
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
     )
 
 def lora_llama3_2_3b(
@@ -565,7 +668,8 @@ def lora_llama3_2_3b(
     use_dora: bool = False,
     quantize_base: bool = False,
     tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 3B model with LoRA enabled.
@@ -614,5 +718,38 @@ def lora_llama3_2_3b(
         use_dora=use_dora,
         quantize_base=quantize_base,
         tie_word_embeddings=tie_word_embeddings,
-        norm_normal_before=norm_normal_before
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
     )
+
+
+class FeedForwardFineuneUp(nn.Module):
+    def __init__(
+        self,
+        *,
+        gate_proj: nn.Module,
+        down_proj: nn.Module,
+        up_proj: Optional[nn.Module] = None,
+        activation: nn.Module = nn.SiLU(),
+    ):
+        super().__init__()
+        self.w1 = gate_proj
+        self.w2 = down_proj
+        self.w3 = up_proj
+        self.activation = activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.activation(self.w1(x))
+        if self.w3 is not None:
+            h = h * self.w3(x)
+        h = self.w2(h)
+        return h
+
+    def adapter_params(self) -> List[str]:
+        return ["w1.weight", "w3.weight"] # "w2.weight"
+
+def llama3_mlp_finetune(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedForward:
+    gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+    down_proj = nn.Linear(hidden_dim, dim, bias=False)
+    up_proj = nn.Linear(dim, hidden_dim, bias=False)
+    return FeedForwardFineuneUp(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
