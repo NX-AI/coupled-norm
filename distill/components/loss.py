@@ -30,7 +30,7 @@ class ForwardKLLoss(torch.nn.Module):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
-        normalize: bool = True,
+        temperature: float = 1.0,
     ) -> torch.Tensor:
         """
         Args:
@@ -46,19 +46,14 @@ class ForwardKLLoss(torch.nn.Module):
             torch.Tensor: KL divergence loss of shape (1,).
         """
 
-        teacher_prob = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+        teacher_prob = F.softmax(teacher_logits / temperature, dim=-1, dtype=torch.float32)
+        teacher_logprob = F.log_softmax(teacher_logits / temperature, dim=-1, dtype=torch.float32)
         inf_mask = torch.isinf(student_logits)
-        student_logprob = F.log_softmax(student_logits, dim=-1, dtype=torch.float32)
-        prod_probs = torch.masked_fill(teacher_prob * student_logprob, inf_mask, 0)
-        x = torch.sum(prod_probs, dim=-1).view(-1)
+        student_logprob = F.log_softmax(student_logits / temperature, dim=-1, dtype=torch.float32)
+        prod_probs = torch.masked_fill(teacher_prob * (teacher_logprob - student_logprob), inf_mask, 0)
+        x = (torch.sum(prod_probs, dim=-1) * (temperature ** 2)).view(-1)
         mask = (labels != self.ignore_index).int()
-        if not normalize:
-            return -torch.sum(x * mask.view(-1), dim=0)
-
-        sum_masks = torch.sum(mask.view(-1), dim=0)
-        if sum_masks == 0:
-            return torch.tensor(0.0, device=x.device)
-        return -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
+        return torch.sum(x * mask.view(-1), dim=0)
 
 class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
     """
@@ -79,10 +74,11 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             Default: -100
     """
 
-    def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100):
+    def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100, temperature: float = 1.0):
         super().__init__()
         self.num_output_chunks = num_output_chunks
         self.ignore_index = ignore_index
+        self.temperature = temperature
         self.fkl_loss = ForwardKLLoss(ignore_index)
 
     def forward(
@@ -135,7 +131,7 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             student_logits, teacher_logits, labels
         ):
             total_fkl_loss += self.fkl_loss(
-                student_chunk, teacher_chunk, label_chunk, normalize=False
+                student_chunk, teacher_chunk, label_chunk, self.temperature
             )
 
         sum_masks = torch.sum(mask.view(-1), dim=0)
@@ -143,3 +139,4 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             return torch.tensor(0.0, device=student_logits[0].device)
 
         return total_fkl_loss / torch.sum(mask.view(-1), dim=0)
+

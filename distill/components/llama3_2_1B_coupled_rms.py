@@ -199,10 +199,13 @@ class TransformerSelfAttentionLayer(nn.Module):
 
         # fix_scalers = [0.845, 0.817, 0.857, 0.892, 0.93, 0.933, 0.939, 0.916, 0.923, 0.875, 0.971, 0.907, 0.915, 0.91, 0.871, 0.925]
 
-        if self.norm_normal_before is not None and (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):
+        # print(self.norm_normal_before, self.norm_normal_after, self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after)
+        if (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):
             attn_scaler = None
         else:
             attn_scaler = attn_scaler * 0.9
+
+        # attn_scaler = None
 
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = self.sa_scale(attn_out) + x
@@ -339,7 +342,7 @@ def lora_llama3_mlp(
         quantize_base=quantize_base,
     )
 
-    down_proj = nn.Linear(hidden_dim, dim, bias=False)
+    # down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     up_proj = adapter_cls(
         in_dim=dim,
@@ -357,6 +360,38 @@ def lora_llama3_mlp(
         up_proj=up_proj,
     )
 
+
+
+class FeedForwardFineuneUp(nn.Module):
+    def __init__(
+        self,
+        *,
+        gate_proj: nn.Module,
+        down_proj: nn.Module,
+        up_proj: Optional[nn.Module] = None,
+        activation: nn.Module = nn.SiLU(),
+    ):
+        super().__init__()
+        self.w1 = gate_proj
+        self.w2 = down_proj
+        self.w3 = up_proj
+        self.activation = activation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.activation(self.w1(x))
+        if self.w3 is not None:
+            h = h * self.w3(x)
+        h = self.w2(h)
+        return h
+
+    def adapter_params(self) -> List[str]:
+        return ["w1.weight", "w2.weight", "w3.weight"] # 
+
+def llama3_mlp_finetune(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedForward:
+    gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+    down_proj = nn.Linear(hidden_dim, dim, bias=False)
+    up_proj = nn.Linear(dim, hidden_dim, bias=False)
+    return FeedForwardFineuneUp(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
 
 
 def lora_llama3_2(
@@ -480,10 +515,10 @@ def lora_llama3_2(
                 lora_dropout=lora_dropout,
                 use_dora=use_dora,
             )
+            # mlp = llama3_mlp_finetune(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
         else:
             mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
 
-        # mlp = llama3_mlp_finetune(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
 
         layer = TransformerSelfAttentionLayer(
             idx=i,
@@ -722,34 +757,3 @@ def lora_llama3_2_3b(
         norm_normal_after=norm_normal_after,
     )
 
-
-class FeedForwardFineuneUp(nn.Module):
-    def __init__(
-        self,
-        *,
-        gate_proj: nn.Module,
-        down_proj: nn.Module,
-        up_proj: Optional[nn.Module] = None,
-        activation: nn.Module = nn.SiLU(),
-    ):
-        super().__init__()
-        self.w1 = gate_proj
-        self.w2 = down_proj
-        self.w3 = up_proj
-        self.activation = activation
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.activation(self.w1(x))
-        if self.w3 is not None:
-            h = h * self.w3(x)
-        h = self.w2(h)
-        return h
-
-    def adapter_params(self) -> List[str]:
-        return ["w1.weight", "w3.weight"] # "w2.weight"
-
-def llama3_mlp_finetune(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedForward:
-    gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-    down_proj = nn.Linear(hidden_dim, dim, bias=False)
-    up_proj = nn.Linear(dim, hidden_dim, bias=False)
-    return FeedForwardFineuneUp(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
