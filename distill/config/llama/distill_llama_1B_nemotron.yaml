@@ -16,6 +16,7 @@ model:
   lora_alpha: 256  # usually alpha=2*rank
   lora_dropout: 0.0
   use_dora: True
+  coupled_init_downscale: 0.9
 
 teacher_model:
   _component_: torchtune.models.llama3_2.llama3_2_1b
@@ -63,21 +64,21 @@ nix:
       conversation_column: messages
       conversation_style: openai
       train_on_input: False
-      packed: True
+      packed: False
       split: chat[:200000]
     - _component_: torchtune.datasets.chat_dataset
       source: nvidia/Nemotron-Post-Training-Dataset-v2
       conversation_column: messages
       conversation_style: openai
       train_on_input: False
-      packed: True
+      packed: False
       split: math[:100000]
     - _component_: torchtune.datasets.chat_dataset
       source: nvidia/Nemotron-Post-Training-Dataset-v2
       conversation_column: messages
       conversation_style: openai
       train_on_input: False
-      packed: True
+      packed: False
       split: stem[:100000]
 
 seed: 67
@@ -88,7 +89,7 @@ batch_size: 4
 optimizer:
   _component_: torch.optim.AdamW
   fused: True
-  weight_decay: 0.01
+  weight_decay: 0.0 # 0.01
   lr: 3e-4
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
@@ -98,7 +99,7 @@ loss:
   _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
 
 kd_loss:
-  _component_: torchtune.modules.loss.ForwardKLWithChunkedOutputLoss
+  _component_: components.loss.ForwardKLWithChunkedOutputLoss
 kd_ratio: 1.0
 
 # Training

@@ -31,6 +31,7 @@ class ForwardKLLoss(torch.nn.Module):
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
         temperature: float = 1.0,
+        normalize: bool = True
     ) -> torch.Tensor:
         """
         Args:
@@ -53,7 +54,18 @@ class ForwardKLLoss(torch.nn.Module):
         prod_probs = torch.masked_fill(teacher_prob * (teacher_logprob - student_logprob), inf_mask, 0)
         x = (torch.sum(prod_probs, dim=-1) * (temperature ** 2)).view(-1)
         mask = (labels != self.ignore_index).int()
-        return torch.sum(x * mask.view(-1), dim=0)
+        # return torch.sum(x * mask.view(-1), dim=0)
+
+        if not normalize:
+            return torch.sum(x * mask.view(-1), dim=0)
+
+        sum_masks = torch.sum(mask.view(-1), dim=0)
+        if sum_masks == 0:
+            return torch.tensor(0.0, device=x.device)
+        return torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
+
+
+
 
 class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
     """

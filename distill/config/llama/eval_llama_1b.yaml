@@ -6,6 +6,8 @@ output_dir: ./ # Not needed
 model:
   _component_: components.llama3_2_1B_coupled_rms.llama3_2_1b 
   norm_normal_before: 3
+  norm_normal_after: 100
+  coupled_init_downscale: 0.9
 
 # Checkpointer
 checkpointer:

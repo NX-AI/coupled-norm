@@ -107,6 +107,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         mlp_scale: Optional[nn.Module] = None,
         norm_normal_before: int | None = None,
         norm_normal_after: int | None = None,
+        coupled_init_downscale: float = 0.9,
     ) -> None:
         super().__init__()
         self.idx = idx
@@ -118,6 +119,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         self.mlp_norm = mlp_norm or nn.Identity()
         self.sa_scale = sa_scale or nn.Identity()
         self.mlp_scale = mlp_scale or nn.Identity()
+        self.coupled_init_downscale = coupled_init_downscale
 
     def setup_caches(
         self,
@@ -203,7 +205,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         if (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):
             attn_scaler = None
         else:
-            attn_scaler = attn_scaler * 0.9
+            attn_scaler = attn_scaler * self.coupled_init_downscale
 
         # attn_scaler = None
 
@@ -233,6 +235,7 @@ def llama3_2(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Build the decoder associated with the Llama3.2 model. This includes:
@@ -293,6 +296,7 @@ def llama3_2(
             mlp=mlp,
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
             mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+            coupled_init_downscale=coupled_init_downscale,
         )
         layers.append(layer)
 
@@ -421,6 +425,7 @@ def lora_llama3_2(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Return a version of Llama3.2 (an instance of :func:`~torchtune.modules.TransformerDecoder`)
@@ -528,6 +533,7 @@ def lora_llama3_2(
             mlp=mlp,
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
             mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after),
+            coupled_init_downscale=coupled_init_downscale,
         )
         layers.append(layer)
 
@@ -572,6 +578,7 @@ def llama3_2_1b(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 model initialized w/ the default 1b parameter values.
@@ -597,12 +604,14 @@ def llama3_2_1b(
         tie_word_embeddings=tie_word_embeddings,
         norm_normal_before=norm_normal_before,
         norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
     )
 
 def llama3_2_3b(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 model initialized w/ the default 3b parameter values.
@@ -627,7 +636,8 @@ def llama3_2_3b(
         scale_factor=32,
         tie_word_embeddings=tie_word_embeddings,
         norm_normal_before=norm_normal_before,
-        norm_normal_after=norm_normal_after
+        norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
     )
 
 def lora_llama3_2_1b(
@@ -642,6 +652,7 @@ def lora_llama3_2_1b(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 1B model with LoRA enabled.
@@ -691,6 +702,7 @@ def lora_llama3_2_1b(
         tie_word_embeddings=tie_word_embeddings,
         norm_normal_before=norm_normal_before,
         norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
     )
 
 def lora_llama3_2_3b(
@@ -705,6 +717,7 @@ def lora_llama3_2_3b(
     tie_word_embeddings: bool = True,
     norm_normal_before: int | None = None,
     norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
     """
     Builder for creating a Llama3.2 3B model with LoRA enabled.
@@ -755,5 +768,6 @@ def lora_llama3_2_3b(
         tie_word_embeddings=tie_word_embeddings,
         norm_normal_before=norm_normal_before,
         norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
     )
 
