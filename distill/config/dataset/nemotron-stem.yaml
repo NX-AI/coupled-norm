@@ -1,0 +1,7 @@
+_component_: torchtune.datasets.chat_dataset
+source: nvidia/Nemotron-Post-Training-Dataset-v2
+conversation_column: messages
+conversation_style: openai
+train_on_input: False
+packed: False
+split: stem

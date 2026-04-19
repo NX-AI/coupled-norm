@@ -8,12 +8,14 @@ import sys
 import time
 
 from functools import partial
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union
 from warnings import warn
 
 import torch
 import torchtune.modules.common_utils as common_utils
-from omegaconf import DictConfig, ListConfig
+
+import hydra
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from torch import nn
 from torch.optim import Optimizer
@@ -22,6 +24,11 @@ from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, modules, training, utils
 from torchtune.data import padded_collate_packed, padded_collate_sft
 from torchtune.datasets import ConcatDataset
+from torchtune.data import left_pad_sequence
+from torchtune.generation import generate
+from torchtune.modules import TransformerDecoder
+from torchtune.modules.common_utils import local_kv_cache
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
 from torchtune.modules.peft import (
     get_adapter_params,
     get_adapter_state_dict,
@@ -33,9 +40,159 @@ from torchtune.modules.peft import (
 from torchtune.recipe_interfaces import FTRecipeInterface
 from torchtune.training import DummyProfiler, PROFILER_KEY
 
+from lm_eval.evaluator import evaluate
+from lm_eval.models.hf_vlms import HFMultimodalLM
+from lm_eval.models.huggingface import HFLM
+from lm_eval.tasks import get_task_dict, TaskManager
+from lm_eval.utils import make_table
+from omegaconf import DictConfig
+
 from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
+
+class _LLMEvalWrapper(HFLM):
+    """An EvalWrapper for EleutherAI's eval harness based on gpt-fast's
+    EvalWrapper: https://github.com/pytorch-labs/gpt-fast/blob/main/eval.py.
+
+    Note:
+        This is for text-only decoder models.
+
+    Args:
+        model (TransformerDecoder): The model to evaluate.
+        tokenizer (ModelTokenizer): Tokenizer associated with the model being evaluated.
+            This should be the same tokenizer used when fine-tuning the model.
+        device (torch.device): The device to use.
+        max_seq_length (int): The maximum sequence length to use.
+        batch_size (int): The batch size per GPU to use.
+        dtype (torch.dtype): dtype for the model caches during generation.
+        enable_kv_cache (bool): Whether to enable KV cache for generation.
+    """
+
+    def __init__(
+        self,
+        model: TransformerDecoder,
+        tokenizer: ModelTokenizer,
+        *,
+        device: torch.device,
+        max_seq_length: int = 4096,
+        batch_size: int = 8,
+        dtype: torch.dtype = torch.float32,
+        enable_kv_cache: bool = True,
+    ):
+        # TODO (@joecummings): Remove this init function so we don't load in extraneous stuff
+        super().__init__(pretrained="gpt2", device=str(device))
+        self._model = model
+        self._tokenizer = tokenizer
+        self._max_seq_length = max_seq_length
+        self._batch_size = batch_size
+        self._dtype = dtype
+        self._enable_kv_cache = enable_kv_cache
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def eot_token_id(self):
+        return self._tokenizer.eos_id
+
+    @property
+    def max_length(self):
+        return self._max_seq_length
+
+    @property
+    def max_gen_toks(self):
+        return 256
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    @property
+    def device(self):
+        return self._device
+
+    @property
+    def enable_kv_cache(self):
+        return self._enable_kv_cache
+
+    def tok_encode(self, text: str, **kwargs) -> List[int]:
+        # Note on add_bos flag: setting to False as this gives better results, for example
+        # +1% on truthfulqa_mc2 with a LoRA finetune. lit-gpt also sets this to False,
+        # see https://github.com/Lightning-AI/lit-gpt/blob/main/eval/lm_eval_harness.py#L66,
+        # though notably fast-gpt does the opposite
+        # https://github.com/pytorch-labs/gpt-fast/blob/main/eval.py#L123.
+        return self._tokenizer.encode(text=text, add_bos=False, add_eos=False)
+
+    def tok_batch_encode(
+        self, text: List[str], left_truncate_len: int = None, **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tokenized_text = [self.tok_encode(x) for x in text]
+
+        # pad left
+        x = left_pad_sequence(
+            [torch.tensor(x) for x in tokenized_text],
+            batch_first=True,
+            padding_value=self._tokenizer.pad_id,
+        )
+
+        # the harness will use left_truncate_len to indicate that the current batch
+        # needs to be truncated to self.max_seq_len - self.max_gen_toks
+        if left_truncate_len is not None:
+            x = x[:, -left_truncate_len:]
+
+        return x, torch.ones_like(x)  # return 'mask' b/c it's expected by the harness
+
+    def tok_decode(self, tokens: Union[List[int], int], **kwargs) -> str:
+        if isinstance(tokens, int):
+            tokens = [tokens]
+        return self._tokenizer.decode(tokens)
+
+    def _model_call(self, inps: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self._model(inps)
+
+    @torch.inference_mode()
+    def _model_generate(
+        self, context: torch.Tensor, **generation_kwargs
+    ) -> torch.Tensor:
+        bsz, seq_len = context.shape
+
+        temperature = generation_kwargs.get("temperature", 0.0)
+        do_sample = generation_kwargs.get("do_sample", False)
+        if do_sample or temperature != 0.0:
+            raise RuntimeError(
+                "Any decoding strategy other than greedy is not supported."
+            )
+
+        # if we've recieved fewer than self._batch_size samples in the current
+        # batch we need to pad the batch out. here we're padding the end of the
+        # current batch to the correct length. this is because when we use static
+        # KV-caches, the model will expect a fixed batch size for all samples.
+        maybe_padded_context = torch.nn.functional.pad(
+            context,
+            (0, 0, 0, self._batch_size - bsz),
+            value=self._tokenizer.eos_id,  # pad with one of the tokenizer's stop tokens so generation can stop early
+        )
+        with local_kv_cache(
+            self.model,
+            batch_size=self.batch_size,
+            device=self.device,
+            dtype=self._dtype,
+            decoder_max_seq_len=self.max_length,
+        ):
+
+            toks, _ = generate(
+                self.model,
+                maybe_padded_context,
+                max_generated_tokens=self.max_gen_toks,
+                temperature=temperature,
+                top_k=None,
+                pad_id=self._tokenizer.pad_id,
+                stop_tokens=self._tokenizer.stop_tokens,
+            )
+        return toks[:bsz]
+
 
 
 class KDRecipeSingleDevice(FTRecipeInterface):
@@ -119,6 +276,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         # logging attributes
         self._output_dir = cfg.output_dir
         self._log_every_n_steps = cfg.get("log_every_n_steps", 1)
+        self._eval_every_n_steps = cfg.get("eval_every_n_steps", 1000)
         self._log_peak_memory_stats = cfg.get("log_peak_memory_stats", False)
 
         if self._log_peak_memory_stats and self._device.type == "cpu":
@@ -227,6 +385,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         # log config with parameter override
         self._metric_logger.log_config(cfg)
 
+        yaml_cfg = OmegaConf.to_yaml(cfg)
+        print(yaml_cfg)
+
         self._compile = cfg.compile
         if cfg.device == "npu" and cfg.compile:
             raise ValueError(
@@ -332,6 +493,25 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         self.ignore_labels_cache = torch.full(
             (cfg.batch_size, 1), self._loss_fn.ignore_index, device=self._device
         )
+
+
+        self.limit = cfg.eval.limit
+        self.batch_size = cfg.eval.batch_size
+        self.enable_kv_cache = cfg.eval.get("enable_kv_cache", True)
+        self.include_path = cfg.eval.get("include_path", None)
+
+        self.eleuther_model_wrapper = _LLMEvalWrapper(
+            self._model,
+            self._tokenizer,
+            device=self._device,
+            max_seq_length=cfg.tokenizer.max_seq_len,
+            batch_size=self.batch_size,
+            dtype=self._dtype,
+            enable_kv_cache=self.enable_kv_cache,
+        )
+
+        self._train_eval_tasks = cfg.eval.tasks.train
+
 
     def _setup_profiler(
         self, cfg_profiler: Optional[DictConfig] = None
@@ -804,6 +984,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
                             step=self.global_step,
                         )
 
+                    if self.global_step % self._eval_every_n_steps == 0:
+                        self.evaluate(self._train_eval_tasks, "eval_train")
+
                     # Reset running stats for the next step
                     running_class_loss = 0
                     running_kd_loss = 0
@@ -841,8 +1024,38 @@ class KDRecipeSingleDevice(FTRecipeInterface):
     def cleanup(self) -> None:
         self._metric_logger.close()
 
+    def evaluate(self, tasks: list[str], log_prefix: str) -> None:
+        tasks = list(tasks)
+        if len(tasks) == 0: return {}
 
-@config.parse
+        task_manager = TaskManager(include_path=self.include_path)
+        self.eval_task_dict = get_task_dict(tasks, task_manager)
+
+        self._model.eval()
+
+        t0 = time.time()
+        log.info(f"Running evaluation on the following tasks: {tasks}")
+        output = evaluate(self.eleuther_model_wrapper, self.eval_task_dict, limit=self.limit)
+        t1 = time.time() - t0
+
+        log.info(f"Eval completed in {t1:.02f} seconds.")
+        print(f"\n\n{make_table(output)}\n")
+
+        self._model.train()
+
+        wandb_log = {}
+        for task, metrics in output["results"].items():
+            for metric_name, value in metrics.items():
+                if not "stderr" in metric_name and not "norm" in metric_name:
+                    matric = metric_name.replace(',none', '')
+                    wandb_log[f"{log_prefix}/{task}/{matric}"] = value
+        
+        self._metric_logger.log_dict(wandb_log, step=self.global_step)
+
+        return output["results"]
+
+
+@hydra.main(version_base=None, config_path="../config", config_name="config")
 def recipe_main(cfg: DictConfig) -> None:
     """
     Entry point for the recipe.
@@ -854,7 +1067,9 @@ def recipe_main(cfg: DictConfig) -> None:
     config.log_config(recipe_name="KDRecipeSingleDevice", cfg=cfg)
     recipe = KDRecipeSingleDevice(cfg=cfg)
     recipe.setup(cfg=cfg)
+    recipe.evaluate(cfg.eval.tasks.initial, "eval_initial")
     recipe.train()
+    recipe.evaluate(cfg.eval.tasks.end, "eval")
     recipe.cleanup()
 
 

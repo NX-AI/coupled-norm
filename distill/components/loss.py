@@ -11,6 +11,42 @@ import torch.nn.functional as F
 
 
 class ForwardKLLoss(torch.nn.Module):
+    def __init__(self, ignore_index: int = -100, temperature: float = 1.0, normalize: bool = True):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.temperature = temperature
+        self.normalize = normalize
+
+    def forward(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        student_logprob = F.log_softmax(student_logits / self.temperature, dim=-1)
+        teacher_prob = F.softmax(teacher_logits / self.temperature, dim=-1)
+        kl_pointwise = F.kl_div(student_logprob, teacher_prob, reduction='none').sum(dim=-1)
+
+        mask = (labels.view(-1) != self.ignore_index).float()
+        masked_kl = kl_pointwise.view(-1) * mask
+
+        loss_sum = masked_kl.sum()
+        scaled_loss = loss_sum * (self.temperature ** 2)
+
+        total_tokens = mask.sum()
+        if total_tokens == 0:
+            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
+            
+        return scaled_loss / total_tokens if self.normalize else scaled_loss
+
+
+class CELoss(torch.nn.Module):
+
+    def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100):
+        super().__init__()
+        self.num_output_chunks = num_output_chunks
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(logits.float(), labels, ignore_index=self.ignore_index)
+
+
+class ForwardKLLossOld(torch.nn.Module):
     """
     The Kullback-Leibler divergence loss for valid indexes.
     Implementation of https://github.com/jongwooko/distillm/blob/17c0f98bc263b1861a02d5df578c84aea652ee65/distillm/losses.py
@@ -30,41 +66,20 @@ class ForwardKLLoss(torch.nn.Module):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
-        temperature: float = 1.0,
         normalize: bool = True
     ) -> torch.Tensor:
-        """
-        Args:
-            student_logits (torch.Tensor): logits from student model of shape
-                (batch_size*num_tokens, vocab_size).
-            teacher_logits (torch.Tensor): logits from teacher model of shape
-                (batch_size*num_tokens, vocab_size).
-            labels (torch.Tensor): Ground truth labels of shape
-                (batch_size, vocab_size).
-            normalize (bool): Whether to normalize the loss by the number of unmasked elements.
-
-        Returns:
-            torch.Tensor: KL divergence loss of shape (1,).
-        """
-
-        teacher_prob = F.softmax(teacher_logits / temperature, dim=-1, dtype=torch.float32)
-        teacher_logprob = F.log_softmax(teacher_logits / temperature, dim=-1, dtype=torch.float32)
-        inf_mask = torch.isinf(student_logits)
-        student_logprob = F.log_softmax(student_logits / temperature, dim=-1, dtype=torch.float32)
-        prod_probs = torch.masked_fill(teacher_prob * (teacher_logprob - student_logprob), inf_mask, 0)
-        x = (torch.sum(prod_probs, dim=-1) * (temperature ** 2)).view(-1)
+        teacher_prob = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
+        teacher_logprob = F.log_softmax(teacher_logits, dim=-1, dtype=torch.float32)
+        student_logprob = F.log_softmax(student_logits, dim=-1, dtype=torch.float32)
+        prod_probs = teacher_prob * (teacher_logprob - student_logprob)
+        x = (torch.sum(prod_probs, dim=-1)).view(-1)
         mask = (labels != self.ignore_index).int()
-        # return torch.sum(x * mask.view(-1), dim=0)
 
-        if not normalize:
-            return torch.sum(x * mask.view(-1), dim=0)
+        loss_sum = torch.sum(x * mask.view(-1), dim=0)
 
         sum_masks = torch.sum(mask.view(-1), dim=0)
-        if sum_masks == 0:
-            return torch.tensor(0.0, device=x.device)
-        return torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
-
-
+        if sum_masks == 0: return torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        return loss_sum / sum_masks if normalize else loss_sum
 
 
 class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
@@ -151,4 +166,3 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             return torch.tensor(0.0, device=student_logits[0].device)
 
         return total_fkl_loss / torch.sum(mask.view(-1), dim=0)
-

@@ -5,6 +5,7 @@ benchmark/multirun
 benchmark/outputs
 distill/model
 distill/output
+distill/outputs
 *.out
 hf
 wandb
