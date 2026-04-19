@@ -434,6 +434,15 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         base_missing, base_unexpected = model.load_state_dict(
             base_model_state_dict, strict=False
         )
+
+        """
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if "scale" in name and param.requires_grad:
+                    param.data *= cfg_model.coupled_init_downscale
+                    print(f"Scaled: {name} by {cfg_model.coupled_init_downscale}")
+        """
+
         # This is for any adapters that need to be initialized after base weights
         # have been loaded (e.g. DoRA).
         if self._is_dora:
@@ -446,7 +455,6 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             )
         else:
             lora_missing, lora_unexpected = None, None
-    
         validate_missing_and_unexpected_for_lora(
             lora_attn_modules=self._lora_attn_modules,
             apply_lora_to_mlp=self._apply_lora_to_mlp,
@@ -506,7 +514,29 @@ class KDRecipeSingleDevice(FTRecipeInterface):
     def _setup_optimizer(
         self, cfg_optimizer: DictConfig, opt_state_dict: Optional[Dict[str, Any]] = None
     ) -> Optimizer:
-        optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
+
+        """
+        scaler_params = []
+        other_params = []
+
+        for name, param in self._model.named_parameters():
+            if param.requires_grad:
+                if "scale" in name:
+                    scaler_params.append(param)
+                    print(f"Scale: {name}")
+                else:
+                    other_params.append(param)
+
+    
+        parameter_groups = [
+            {"params": scaler_params, "lr": 1e-3},
+            {"params": other_params}
+        ]
+        """
+        # TODO: Unused:
+        parameter_groups = self._model.parameters() 
+
+        optimizer = config.instantiate(cfg_optimizer, parameter_groups)
         if opt_state_dict:
             optimizer.load_state_dict(opt_state_dict)
 
