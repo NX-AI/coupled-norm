@@ -1,0 +1,36 @@
+model_id: meta-llama/Llama-3.2-1B
+batch_size: 2560
+new_tokens: 1
+
+prompt: |
+  A Turing machine is a mathematical model of computation describing an abstract machine[1] that manipulates symbols on a strip of tape according to a table of rules.[2] Despite the model's simplicity, it is capable of implementing any computer algorithm.[3]
+
+  The machine operates on an infinite[4] memory tape divided into discrete cells,[5] each of which can hold a single symbol drawn from a finite set of symbols called the alphabet of the machine. It has a "head" that, at any point in the machine's operation, is positioned over one of these cells, and a "state" selected from a finite set of states. At each step of its operation, the head reads the symbol in its cell. Then, based on the symbol and the machine's own present state, the machine writes a symbol into the same cell, and moves the head one step to the left or the right,[6] or halts the computation. The choice of which replacement symbol to write, which direction to move the head, and whether to halt is based on a finite table that specifies what to do for each combination of the current state and the symbol that is read. As with a real computer program, it is possible for a Turing machine to go into an infinite loop which will never halt.
+
+  The Turing machine was invented in 1936 by Alan Turing,[7][11] who called it an "a-machine" (automatic machine).[12] It was Turing's doctoral advisor, Alonzo Church, who later coined the term "Turing machine" in a review.[13] With this model, Turing was able to answer two questions in the negative:
+
+  Does a machine exist that can determine whether any arbitrary machine on its tape is "circular" (e.g., freezes, or fails to continue its computational task)?
+  Does a machine exist that can determine whether any arbitrary machine on its tape ever prints a given symbol?[14][15]
+  Thus by providing a mathematical description of a very simple device capable of arbitrary computations, he was able to prove properties of computation in general—and in particular, the uncomputability of the Entscheidungsproblem, or 'decision problem' (whether every mathematical statement is provable or disprovable).[16]
+
+  Turing machines proved the existence of fundamental limitations on the power of mechanical computation.[3]
+
+  While they can express arbitrary computations, their minimalist design makes them too slow for computation in practice: real-world computers are based on different designs that, unlike Turing machines, use random-access memory.
+
+  Turing completeness is the ability for a model of computation or a system of instructions to simulate a Turing machine. A programming language that is Turing complete is theoretically capable of expressing all tasks accomplishable by computers; nearly all programming languages are Turing complete if the limitations of finite memory are ignored.
+
+  Overview
+  A Turing machine is an idealised model of a central processing unit (CPU) that controls all data manipulation done by a computer, with the canonical machine using sequential memory to store data. Typically, the sequential memory is represented as a tape of infinite length on which the machine can perform read and write operations.
+
+  In the context of formal language theory, a Turing machine (automaton) is capable of enumerating some arbitrary subset of valid strings of an alphabet. A set of strings which can be enumerated in this manner is called a recursively enumerable language. The Turing machine can equivalently be defined as a model that recognises valid input strings, rather than enumerating output strings.
+
+  Given a Turing machine M and an arbitrary string s, it is generally not possible to decide whether M will eventually produce s. This is due to the fact that the halting problem is unsolvable, which has major implications for the theoretical limits of computing.
+
+  A Turing machine that is able to simulate any other Turing machine is called a universal Turing machine (UTM, or simply a universal machine). Another mathematical formalism, lambda calculus, with a similar "universal" nature was introduced by Alonzo Church. Church's work intertwined with Turing's to form the basis for the Church–Turing thesis. This thesis states that Turing machines, lambda calculus, and other similar formalisms of computation do indeed capture the informal notion of effective methods in logic and mathematics and thus provide a model through which one can reason about an algorithm or "mechanical procedure" in a mathematically precise way without being tied to any particular formalism. Studying the abstract properties of Turing machines has yielded many insights into computer science, computability theory, and complexity theory.
+
+  Physical description
+  In his 1948 essay, "Intelligent Machinery", Turing wrote that his machine consists of:
+
+  ...an unlimited memory capacity obtained in the form of an infinite tape marked out into squares, on each of which a symbol could be printed. At any moment there is one symbol in the machine; it is called the scanned symbol. The machine can alter the scanned symbol, and its behavior is in part determined by that symbol, but the symbols on the tape elsewhere do not affect the behavior of the machine. However, the tape can be moved back and forth through the machine, this being one of the elementary operations of the machine. Any symbol on the tape may therefore eventually have an innings.[17]
+
+  - Turing 1948[18]
