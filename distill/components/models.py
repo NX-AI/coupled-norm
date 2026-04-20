@@ -60,7 +60,7 @@ def setup_caches(
 TransformerDecoder.setup_caches = setup_caches
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, unfreeze = True) -> None:
+    def __init__(self, dim: int, eps: float = 1e-6, unfreeze = True, coupled_downscale: float | None = None) -> None:
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
@@ -165,34 +165,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         **kwargs: Dict,
     ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape
-                [batch_size x seq_length x embed_dim]
-            mask (Optional[_MaskType]): Used to mask the scores after the query-key multiplication
-                and before the softmax. Either:
-
-                A boolean tensor with shape ``[b x s x s]``, ``[b x s x self.encoder_max_cache_seq_len]``,
-                or ``[b x s x self.encoder_max_cache_seq_len]`` if using KV-cacheing with encoder/decoder layers.
-                A value of True in row ``i`` and column ``j`` means token ``i`` attends to token ``j``. A value of False means
-                token ``i`` does not attend to token ``j``. If no mask is specified, a causal mask
-                is used by default.
-
-                A :class:`~torch.nn.attention.flex_attention.BlockMask` for document masking in a packed sequence
-                created via `create_block_mask <https://pytorch.org/blog/flexattention/#mask-mods>`_. We  use
-                :func:`~torch.nn.attention.flex_attention.flex_attention` when computing attention with block masks.
-                Default is None.
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b x s].
-                During inference, this indicates the position of the current token.
-                If none, assume the index of the token is its position id. Default is None.
-            **kwargs (Dict): transformer layer inputs not relevant to self attention.
-
-        Returns:
-            torch.Tensor: output tensor with same shape as input
-                [batch_size x seq_length x embed_dim]
-        """
         # Input tensor and attention output have the same shape
         # [b, s, d]
         # Norm applied before self-attention
@@ -218,103 +190,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         out = h + self.mlp_scale(mlp_out)
         return out
-
-
-def llama3_2(
-    vocab_size: int,
-    num_layers: int,
-    num_heads: int,
-    num_kv_heads: int,
-    embed_dim: int,
-    max_seq_len: int,
-    attn_dropout: float = 0.0,
-    rope_base: int = 500_000,
-    intermediate_dim: Optional[int] = None,
-    norm_eps: float = 1e-5,
-    scale_factor: int = 32,
-    tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None,
-    norm_normal_after: int | None = None,
-    coupled_init_downscale: float = 0.9,
-) -> TransformerDecoder:
-    """
-    Build the decoder associated with the Llama3.2 model. This includes:
-    - Token embeddings
-    - num_layers number of TransformerSelfAttentionLayer blocks
-    - RMS Norm layer applied to the output of the transformer
-    - Final projection into token space
-
-    Args:
-        vocab_size (int): number of tokens in vocabulary.
-        num_layers (int): number of layers in the transformer decoder.
-        num_heads (int): number of query heads. For MHA this is also the
-            number of heads for key and value
-        num_kv_heads (int): number of key and value heads. User should ensure
-            `num_heads` % `num_kv_heads` == 0. For standard MHA set `num_kv_heads` == `num_heads`,
-            for GQA `num_kv_heads` < `num_heads`, and for MQA set `num_kv_heads` == 1.
-        embed_dim (int): embedding dimension for self-attention
-        max_seq_len (int): maximum sequence length the model will be run with, as used
-            by :func:`~torchtune.modules.KVCache`
-        rope_base (int): base for the rotary positional embeddings. Default: 500_000
-        attn_dropout (float): dropout value passed onto scaled_dot_product_attention.
-            Default: 0.0
-        intermediate_dim (Optional[int]): intermediate dimension for MLP. If not specified,
-            this is computed using :func:`~torchtune.modules.scale_hidden_dim_for_mlp`
-        norm_eps (float): epsilon in RMS norms.
-        scale_factor (int): scaling factor for RoPE. Default: 32
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 model.
-    """
-    head_dim = embed_dim // num_heads
-    num_kv_heads = num_kv_heads if num_kv_heads else num_heads
-    rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor)
-
-    layers = nn.ModuleList()
-    for i in range(num_layers):
-        self_attn = MultiHeadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
-            k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
-            v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
-            output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
-            pos_embeddings=rope,
-            max_seq_len=max_seq_len,
-            attn_dropout=attn_dropout,
-        )
-        hidden_dim = intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
-        mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim)
-        layer = TransformerSelfAttentionLayer(
-            idx=i,
-            norm_normal_before=norm_normal_before,
-            norm_normal_after=norm_normal_after,
-            attn=self_attn,
-            mlp=mlp,
-            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
-            coupled_init_downscale=coupled_init_downscale,
-        )
-        layers.append(layer)
-
-    tok_embeddings = nn.Embedding(vocab_size, embed_dim)
-    if tie_word_embeddings:
-        output_proj = TiedLinear(tok_embeddings)
-    else:
-        output_proj = nn.Linear(embed_dim, vocab_size, bias=False)
-
-    return TransformerDecoder(
-        tok_embeddings=tok_embeddings,
-        layers=layers,
-        max_seq_len=max_seq_len,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        norm=RMSNorm(embed_dim, eps=norm_eps, unfreeze=False),
-        output=output_proj,
-    )
 
 def lora_llama3_mlp(
     *,
@@ -427,49 +302,6 @@ def lora_llama3_2(
     norm_normal_after: int | None = None,
     coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
-    """
-    Return a version of Llama3.2 (an instance of :func:`~torchtune.modules.TransformerDecoder`)
-    with LoRA applied based on the passed in configuration.
-
-    Args:
-        lora_attn_modules (List[LORA_ATTN_MODULES]): list of which linear layers
-            LoRA should be applied to in each self-attention block. Options are
-            ``{"q_proj", "k_proj", "v_proj", "output_proj"}``.
-        apply_lora_to_mlp (bool): whether to apply LoRA to the MLP in each transformer layer.
-            Default: False
-        apply_lora_to_output (bool): whether to apply LoRA to the model's final output projection.
-            Default: False
-        vocab_size (int): number of tokens in vocabulary.
-        num_layers (int): number of layers in the transformer decoder.
-        num_heads (int): number of query heads. For MHA this is also the
-            number of heads for key and value
-        num_kv_heads (int): number of key and value heads. User should ensure
-            `num_heads` % `num_kv_heads` == 0. For standard MHA set `num_kv_heads` == `num_heads`,
-            for GQA `num_kv_heads` < `num_heads`, and for MQA set `num_kv_heads` == 1.
-        embed_dim (int): embedding dimension for self-attention
-        max_seq_len (int): maximum sequence length the model will be run with, as used
-            by :func:`~torchtune.modules.KVCache`
-        attn_dropout (float): dropout value passed onto scaled_dot_product_attention.
-            Default: 0.0
-        intermediate_dim (Optional[int]): intermediate dimension for MLP. If not specified,
-            this is computed using :func:`~torchtune.modules.scale_hidden_dim_for_mlp`
-        norm_eps (float): epsilon in RMS norms.
-        rope_base (int): base for the rotary positional embeddings. Default: 500_000
-        scale_factor (int): scaling factor for RoPE. Default: 32
-        lora_rank (int): rank of each low-rank approximation
-        lora_alpha (float): scaling factor for the low-rank approximation
-        lora_dropout (float): LoRA dropout probability. Default: 0.0
-        quantize_base: (bool): Whether to quantize base model weights or not. Only applied to base
-            weights within linear layers LoRA is applied to. The final output linear projection is not
-            supported for quantization currently.
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 model with LoRA applied to
-        a subset of the attention projections in each layer.
-
-    """
-
     hidden_dim = intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
     head_dim = embed_dim // num_heads
     rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor)
@@ -507,9 +339,6 @@ def lora_llama3_2(
                 attn_dropout=attn_dropout,
             )
 
-        norm_normal_before_fixed_for_baseline = 3
-        # TODO: Baseline script currently broken, we still need to apply lora to the MLP layers
-
         if apply_lora_to_mlp and i > norm_normal_before and i < norm_normal_after:
             mlp = lora_llama3_mlp(
                 dim=embed_dim,
@@ -527,12 +356,12 @@ def lora_llama3_2(
 
         layer = TransformerSelfAttentionLayer(
             idx=i,
-            norm_normal_before=norm_normal_before,
-            norm_normal_after=norm_normal_after,
             attn=self_attn,
             mlp=mlp,
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after),
+            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after, coupled_downscale=coupled_init_downscale),
+            norm_normal_before=norm_normal_before,
+            norm_normal_after=norm_normal_after,
             coupled_init_downscale=coupled_init_downscale,
         )
         layers.append(layer)
@@ -568,78 +397,6 @@ def lora_llama3_2(
 
     return model
 
-
-"""
-Model builders build specific instantiations using component builders. For example
-the llama3_2_1b model builder uses the llama3_2 component builder to create the
-Llama3.2 1B model.
-"""
-def llama3_2_1b(
-    tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None,
-    norm_normal_after: int | None = None,
-    coupled_init_downscale: float = 0.9,
-) -> TransformerDecoder:
-    """
-    Builder for creating a Llama3.2 model initialized w/ the default 1b parameter values.
-    
-    Args:
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 1B model
-    """
-    return llama3_2(
-        vocab_size=128_256,
-        num_layers=16,
-        num_heads=32,
-        num_kv_heads=8,
-        embed_dim=2048,
-        max_seq_len=131072,
-        intermediate_dim=8192,
-        attn_dropout=0.0,
-        norm_eps=1e-5,
-        rope_base=500_000,
-        scale_factor=32,
-        tie_word_embeddings=tie_word_embeddings,
-        norm_normal_before=norm_normal_before,
-        norm_normal_after=norm_normal_after,
-        coupled_init_downscale=coupled_init_downscale,
-    )
-
-def llama3_2_3b(
-    tie_word_embeddings: bool = True,
-    norm_normal_before: int | None = None,
-    norm_normal_after: int | None = None,
-    coupled_init_downscale: float = 0.9,
-) -> TransformerDecoder:
-    """
-    Builder for creating a Llama3.2 model initialized w/ the default 3b parameter values.
-
-    Args:
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 3B model
-    """
-    return llama3_2(
-        vocab_size=128_256,
-        num_layers=28,
-        num_heads=24,
-        num_kv_heads=8,
-        embed_dim=3072,
-        max_seq_len=131072,
-        intermediate_dim=8192,
-        attn_dropout=0.0,
-        norm_eps=1e-5,
-        rope_base=500_000,
-        scale_factor=32,
-        tie_word_embeddings=tie_word_embeddings,
-        norm_normal_before=norm_normal_before,
-        norm_normal_after=norm_normal_after,
-        coupled_init_downscale=coupled_init_downscale,
-    )
-
 def lora_llama3_2_1b(
     lora_attn_modules: List[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
@@ -654,31 +411,6 @@ def lora_llama3_2_1b(
     norm_normal_after: int | None = None,
     coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
-    """
-    Builder for creating a Llama3.2 1B model with LoRA enabled.
-    The Llama3.2 defaults are the same as in :func:`~torchtune.models.llama3_2.llama3_2_1b`,
-    while LoRA default params are based on
-    https://github.com/tloen/alpaca-lora/blob/8bb8579e403dc78e37fe81ffbb253c413007323f/finetune.py#L41-L43.
-    
-    Args:
-        lora_attn_modules (List[LORA_ATTN_MODULES]): list of which linear layers
-            LoRA should be applied to in each self-attention block. Options are
-            ``{"q_proj", "k_proj", "v_proj", "output_proj"}``.
-        apply_lora_to_mlp (bool): whether to apply LoRA to the MLP in each transformer layer.
-            Default: False
-        apply_lora_to_output (bool): whether to apply LoRA to the model's final output projection.
-            Default: False
-        lora_rank (int): rank of each low-rank approximation
-        lora_alpha (float): scaling factor for the low-rank approximation
-        lora_dropout (float): dropout probability for the low-rank approximation
-        use_dora (bool): Decompose the LoRA weight into magnitude and direction, as
-            introduced in "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09353).
-        quantize_base (bool): Whether to quantize base model weights
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 1B model with LoRA applied
-    """
     return lora_llama3_2(
         lora_attn_modules=lora_attn_modules,
         apply_lora_to_mlp=apply_lora_to_mlp,
@@ -719,32 +451,6 @@ def lora_llama3_2_3b(
     norm_normal_after: int | None = None,
     coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
-    """
-    Builder for creating a Llama3.2 3B model with LoRA enabled.
-    The Llama3.2 defaults are the same as in :func:`~torchtune.models.llama3_2.llama3_2_3b`,
-    while LoRA default params are based on
-    https://github.com/tloen/alpaca-lora/blob/8bb8579e403dc78e37fe81ffbb253c413007323f/finetune.py#L41-L43.
-
-    Args:
-        lora_attn_modules (List[LORA_ATTN_MODULES]): list of which linear layers
-            LoRA should be applied to in each self-attention block. Options are
-            ``{"q_proj", "k_proj", "v_proj", "output_proj"}``.
-        apply_lora_to_mlp (bool): whether to apply LoRA to the MLP in each transformer layer.
-            Default: False
-        apply_lora_to_output (bool): whether to apply LoRA to the model's final output projection.
-            Default: False
-        lora_rank (int): rank of each low-rank approximation
-        lora_alpha (float): scaling factor for the low-rank approximation
-        lora_dropout (float): dropout probability for the low-rank approximation
-        use_dora (bool): Decompose the LoRA weight into magnitude and direction, as
-            introduced in "DoRA: Weight-Decomposed Low-Rank Adaptation" (https://arxiv.org/abs/2402.09353).
-        quantize_base (bool): Whether to quantize base model weights
-        tie_word_embeddings (bool): whether the model's input and output word embeddings should be tied.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 3B model with LoRA applied
-    """
-           
     return lora_llama3_2(
         lora_attn_modules=lora_attn_modules,
         apply_lora_to_mlp=apply_lora_to_mlp,
@@ -771,3 +477,324 @@ def lora_llama3_2_3b(
         coupled_init_downscale=coupled_init_downscale,
     )
 
+
+from typing import List, Optional
+
+from torchtune.models.qwen3._component_builders import lora_qwen3, lora_qwen3_mlp, qwen3_mlp
+from torchtune.modules import TransformerDecoder
+from torchtune.modules.peft import LORA_ATTN_MODULES
+
+from functools import partial
+from typing import Optional
+from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
+
+from torch import nn
+from torchtune.modules.transformer import TransformerDecoder
+from torchtune.models.qwen2._positional_embeddings import Qwen2RotaryPositionalEmbeddings
+from torchtune.models.qwen3._attention import Qwen3Attention
+from torchtune.modules import FeedForward, TiedLinear
+from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
+from torchtune.modules import RMSNorm as RMSNormNormal
+
+
+
+def lora_qwen3(
+    lora_attn_modules: list[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    *,
+    # qwen2 args
+    vocab_size: int,
+    num_layers: int,
+    num_heads: int,
+    num_kv_heads: int,
+    embed_dim: int,
+    intermediate_dim: int,
+    max_seq_len: int,
+    head_dim: Optional[int] = None,
+    attn_dropout: float = 0.0,
+    norm_eps: float = 1e-5,
+    rope_base: float = 1_000_000.0,
+    tie_word_embeddings: bool = False,
+    q_proj_bias: bool = True,
+    k_proj_bias: bool = True,
+    v_proj_bias: bool = True,
+    q_norm: bool = False,
+    k_norm: bool = False,
+    # LoRA args
+    lora_rank: int,
+    lora_alpha: float,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    # Quantization args
+    quantize_base: bool = False,
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
+) -> TransformerDecoder:
+    head_dim = head_dim or embed_dim // num_heads
+    num_kv_heads = num_kv_heads if num_kv_heads else num_heads
+
+    rope = Qwen2RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+
+    layers = nn.ModuleList()
+    for i in range(num_layers):
+        self_attn = Qwen3Attention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=q_proj_bias),
+            k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=k_proj_bias),
+            v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=v_proj_bias),
+            output_proj=nn.Linear(num_heads * head_dim, embed_dim, bias=False),
+            pos_embeddings=rope,
+            q_norm=RMSNormNormal(dim=head_dim, eps=norm_eps) if q_norm else None, # norm on head_dim
+            k_norm=RMSNormNormal(dim=head_dim, eps=norm_eps) if k_norm else None,
+            kv_cache=None,
+            max_seq_len=max_seq_len,
+            attn_dropout=attn_dropout,
+        )
+
+        if apply_lora_to_mlp and i > norm_normal_before and i < norm_normal_after:
+            mlp = lora_qwen3_mlp(
+                dim=embed_dim,
+                hidden_dim=intermediate_dim,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                quantize_base=quantize_base,
+                use_dora=use_dora,
+                lora_dropout=lora_dropout,
+            )
+        else:
+            mlp = qwen3_mlp(dim=embed_dim, hidden_dim=intermediate_dim)
+
+        layer = TransformerSelfAttentionLayer(
+            idx=i,
+            attn=self_attn,
+            mlp=mlp,
+            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
+            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after, coupled_downscale=coupled_init_downscale),
+            norm_normal_before=norm_normal_before,
+            norm_normal_after=norm_normal_after,
+            coupled_init_downscale=coupled_init_downscale,
+        )
+        layers.append(layer)
+
+    tok_embeddings = nn.Embedding(vocab_size, embed_dim)
+
+    if tie_word_embeddings:
+        if apply_lora_to_output:
+            raise ValueError(
+                "apply_lora_to_output is incompatible with tie_word_embeddings,"
+                " as there would be no output to apply lora to!"
+            )
+        output_proj = TiedLinear(tok_embeddings)
+    else:
+        # TODO: quantize_base is not applied to final output_proj currently.
+        adapter_cls = DoRALinear if use_dora else LoRALinear
+        output_proj = (
+            adapter_cls(embed_dim, vocab_size, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+            if apply_lora_to_output
+            else nn.Linear(embed_dim, vocab_size, bias=False)
+        )
+    model = TransformerDecoder(
+        tok_embeddings=tok_embeddings,
+        layers=layers,
+        max_seq_len=max_seq_len,
+        num_heads=num_heads,
+        head_dim=(embed_dim // num_heads),
+        norm=RMSNorm(embed_dim, eps=norm_eps, unfreeze=False),
+        output=output_proj,
+    )
+
+    if quantize_base:
+        # For QLoRA, we reparametrize 4-bit tensors to higher precision, and offload to CPU on the fly
+        # so as to not increase peak memory
+        model._register_state_dict_hook(
+            partial(
+                reparametrize_as_dtype_state_dict_post_hook,
+                # TODO this is clowny, figure out a better way to get what precision the rest
+                # of the model is in
+                dtype=tok_embeddings.weight.dtype,
+                offload_to_cpu=True,
+            )
+        )
+
+    return model
+
+
+def lora_qwen3_0_6b_instruct(
+    lora_attn_modules: List[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
+) -> TransformerDecoder:
+    return lora_qwen3(
+        lora_attn_modules=lora_attn_modules,
+        apply_lora_to_mlp=apply_lora_to_mlp,
+        apply_lora_to_output=apply_lora_to_output,
+        vocab_size=151936,
+        num_layers=28,
+        num_heads=16,
+        num_kv_heads=8,
+        embed_dim=1024,
+        intermediate_dim=3072,
+        max_seq_len=40960,
+        head_dim=128,
+        attn_dropout=0.0,
+        norm_eps=1e-6,
+        rope_base=1000000.0,
+        q_proj_bias=False,
+        k_proj_bias=False,
+        v_proj_bias=False,
+        q_norm=True,
+        k_norm=True,
+        tie_word_embeddings=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        use_dora=use_dora,
+        quantize_base=quantize_base,
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
+    )
+
+def lora_qwen3_1_7b_instruct(
+    lora_attn_modules: List[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
+) -> TransformerDecoder:
+    return lora_qwen3(
+        lora_attn_modules=lora_attn_modules,
+        apply_lora_to_mlp=apply_lora_to_mlp,
+        apply_lora_to_output=apply_lora_to_output,
+        vocab_size=151936,
+        num_layers=28,
+        num_heads=16,
+        num_kv_heads=8,
+        embed_dim=2048,
+        intermediate_dim=6144,
+        max_seq_len=40960,
+        head_dim=128,
+        attn_dropout=0.0,
+        norm_eps=1e-6,
+        rope_base=1000000.0,
+        q_proj_bias=False,
+        k_proj_bias=False,
+        v_proj_bias=False,
+        q_norm=True,
+        k_norm=True,
+        tie_word_embeddings=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        use_dora=use_dora,
+        quantize_base=quantize_base,
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
+    )
+
+def lora_qwen3_4b_instruct(
+    lora_attn_modules: List[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
+) -> TransformerDecoder:
+    return lora_qwen3(
+        lora_attn_modules=lora_attn_modules,
+        apply_lora_to_mlp=apply_lora_to_mlp,
+        apply_lora_to_output=apply_lora_to_output,
+        vocab_size=151936,
+        num_layers=36,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=2560,
+        intermediate_dim=9728,
+        max_seq_len=40960,
+        head_dim=128,
+        attn_dropout=0.0,
+        norm_eps=1e-6,
+        rope_base=1000000.0,
+        q_proj_bias=False,
+        k_proj_bias=False,
+        v_proj_bias=False,
+        q_norm=True,
+        k_norm=True,
+        tie_word_embeddings=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        use_dora=use_dora,
+        quantize_base=quantize_base,
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
+    )
+
+def lora_qwen3_8b_instruct(
+    lora_attn_modules: List[LORA_ATTN_MODULES],
+    apply_lora_to_mlp: bool = False,
+    apply_lora_to_output: bool = False,
+    lora_rank: int = 8,
+    lora_alpha: float = 16,
+    lora_dropout: float = 0.0,
+    use_dora: bool = False,
+    quantize_base: bool = False,
+    norm_normal_before: int | None = None,
+    norm_normal_after: int | None = None,
+    coupled_init_downscale: float = 0.9,
+) -> TransformerDecoder:
+    return lora_qwen3(
+        lora_attn_modules=lora_attn_modules,
+        apply_lora_to_mlp=apply_lora_to_mlp,
+        apply_lora_to_output=apply_lora_to_output,
+        vocab_size=151936,
+        num_layers=36,
+        num_heads=32,
+        num_kv_heads=8,
+        embed_dim=4096,
+        intermediate_dim=12288,
+        max_seq_len=40960,
+        head_dim=128,
+        attn_dropout=0.0,
+        norm_eps=1e-6,
+        rope_base=1000000.0,
+        q_proj_bias=False,
+        k_proj_bias=False,
+        v_proj_bias=False,
+        q_norm=True,
+        k_norm=True,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        use_dora=use_dora,
+        quantize_base=quantize_base,
+        norm_normal_before=norm_normal_before,
+        norm_normal_after=norm_normal_after,
+        coupled_init_downscale=coupled_init_downscale,
+    )

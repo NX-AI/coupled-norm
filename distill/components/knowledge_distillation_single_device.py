@@ -377,6 +377,12 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         Setup the recipe state. This includes recipe state (if resume_from_checkpoint is True),
         model, tokenizer, loss, optimizer, learning rate scheduler, sampler, and dataloader.
         """
+        if cfg.eval_baseline_only:
+            cfg.model.norm_normal_before = 100
+
+        self.no_coupled_before = cfg.model.norm_normal_before
+        self.no_coupled_after = cfg.model.norm_normal_after
+        self.coupled_downscale = cfg.model.coupled_init_downscale
 
         self._metric_logger = config.instantiate(cfg.metric_logger)
 
@@ -635,6 +641,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             )
         else:
             lora_missing, lora_unexpected = None, None
+
         validate_missing_and_unexpected_for_lora(
             lora_attn_modules=self._lora_attn_modules,
             apply_lora_to_mlp=self._apply_lora_to_mlp,
@@ -838,6 +845,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
                 self._apply_lora_to_output,
             ),
             "peft_type": "LORA",
+            "no_coupled_before": self.no_coupled_before,
+            "no_coupled_after": self.no_coupled_after,
+            "coupled_downscale": self.coupled_downscale
         }
         ckpt_dict.update({training.ADAPTER_CONFIG: adapter_config})
 
@@ -1024,9 +1034,12 @@ class KDRecipeSingleDevice(FTRecipeInterface):
     def cleanup(self) -> None:
         self._metric_logger.close()
 
-    def evaluate(self, tasks: list[str], log_prefix: str) -> None:
+    def evaluate(self, tasks: list[str], log_prefix: str, seed: int | None = None) -> None:
         tasks = list(tasks)
         if len(tasks) == 0: return {}
+
+        if seed is not None:
+            training.set_seed(seed=seed)
 
         task_manager = TaskManager(include_path=self.include_path)
         self.eval_task_dict = get_task_dict(tasks, task_manager)
@@ -1064,12 +1077,15 @@ def recipe_main(cfg: DictConfig) -> None:
         - Parameters specified in config (see available configs through ``tune ls``)
         - Overwritten by arguments from the command-line
     """
+
     config.log_config(recipe_name="KDRecipeSingleDevice", cfg=cfg)
     recipe = KDRecipeSingleDevice(cfg=cfg)
     recipe.setup(cfg=cfg)
-    recipe.evaluate(cfg.eval.tasks.initial, "eval_initial")
-    recipe.train()
-    recipe.evaluate(cfg.eval.tasks.end, "eval")
+    if cfg.eval_baseline_only:
+        recipe.evaluate(cfg.eval.tasks.end, "eval", seed=1234)
+    else:
+        recipe.train()
+        recipe.evaluate(cfg.eval.tasks.end, "eval", seed=1234)
     recipe.cleanup()
 
 

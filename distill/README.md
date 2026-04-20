@@ -1,9 +1,11 @@
 # Distillation
 
 ## Install
-`pip install torchtune torch torchvision torchao==0.7`
+`pip install torch torchvision torchao==0.7`
 `pip install "lm_eval[hf]==0.4.7" transformers==4.48.3`
 `pip install torch==2.10 torchvision --index-url https://download.pytorch.org/whl/cu126`
+`pip install git+ssh://git@github.com/pytorch/torchtune.git@b22a3ae68c9e254e7ec6afb6ae64b1b32e0f0cbe` # For qwen3
+
 
 ## Run
 

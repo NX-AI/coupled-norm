@@ -5,11 +5,18 @@
 defaults:
   - dataset: nemotron-stem
 
+hydra:
+  run:
+    dir: "/nfs-gpu/users_home/martin/couplednorm-output/outputs/${oc.env:SLURM_JOB_ID, local_run}"
+
+name: coupled
+run_id: "${name}-${oc.env:SLURM_JOB_ID, local_run}"
+
 output_dir: ${hydra:runtime.output_dir}
 
 # Model Arguments
 model:
-  _component_: components.llama3_2_1B_coupled_rms.lora_llama3_2_1b 
+  _component_: components.models.lora_llama3_2_1b 
   norm_normal_before: 3
   norm_normal_after: 100
   # We only add lora to the MLP's
@@ -27,12 +34,12 @@ teacher_model:
 
 tokenizer:
   _component_: torchtune.models.llama3.llama3_tokenizer
-  path: model/Llama-3.2-1B-Instruct/original/tokenizer.model
+  path: /nfs-gpu/users_home/martin/couplednorm-output/model/Llama-3.2-1B-Instruct/original/tokenizer.model
   max_seq_len: 2048
 
 checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
-  checkpoint_dir: model/Llama-3.2-1B-Instruct/
+  checkpoint_dir: /nfs-gpu/users_home/martin/couplednorm-output/model/Llama-3.2-1B-Instruct/
   checkpoint_files: [
     model.safetensors
   ]
@@ -44,7 +51,7 @@ save_adapter_weights_only: False
 
 teacher_checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
-  checkpoint_dir: model/Llama-3.2-1B-Instruct/
+  checkpoint_dir: /nfs-gpu/users_home/martin/couplednorm-output/model/Llama-3.2-1B-Instruct/
   checkpoint_files: [
     model.safetensors
   ]
@@ -56,10 +63,10 @@ optimizer:
   _component_: torch.optim.AdamW
   fused: True
   weight_decay: 0.0 # 0.01
-  lr: 3e-4
+  lr: 1e-5
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
-  num_warmup_steps: 50
+  num_warmup_steps: 250
 
 loss:
   _component_: components.loss.CELoss
@@ -83,16 +90,18 @@ metric_logger:
   _component_: torchtune.training.metric_logging.WandBLogger
   project: coupled-rms-torchtune
   log_dir: ${hydra:runtime.output_dir}/logs
-  name: coupled
+  name: ${run_id}
 
 eval:
   tasks:
-    initial: []
-    train: ["hellaswag"]
+    train: ["hellaswag", "mmlu"]
     end: ["hellaswag", "mmlu", "arc_challenge", "gpqa_main_zeroshot"]
   limit: null
   batch_size: 8
   enable_kv_cache: True
+  seed: 1234
+
+eval_baseline_only: False
 
 log_every_n_steps: 1
 log_peak_memory_stats: True

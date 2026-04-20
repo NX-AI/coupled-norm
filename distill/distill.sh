@@ -12,4 +12,5 @@ set -euo pipefail
 
 source /home/martinloretz/space/coupled-rms-norm/distill/.venv/bin/activate
 
+echo "python components/knowledge_distillation_single_device.py $@"
 python components/knowledge_distillation_single_device.py $@
