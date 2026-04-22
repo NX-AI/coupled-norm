@@ -1,0 +1,46 @@
+
+# Config for single device knowledge distillation (KD) in knowledge_distillation_single_device.py
+# using a LLAMA3 teacher and student model
+
+defaults:
+  - distill_llama_1B
+  - _self_
+
+model:
+  _component_: components.models.lora_qwen3_8b_instruct
+  norm_normal_before: 6 # 1/4 of 28 layers
+  norm_normal_after: 100
+  coupled_init_downscale: 0.92
+
+teacher_model:
+  _component_: torchtune.models.qwen3.qwen3_8b_instruct
+
+tokenizer:
+  _component_: torchtune.models.qwen3.qwen3_tokenizer
+  path: /nfs-gpu/users_home/martin/couplednorm-output/model/Qwen/Qwen3-8B/vocab.json
+  merges_file: /nfs-gpu/users_home/martin/couplednorm-output/model/Qwen/Qwen3-8B/merges.txt
+  max_seq_len: 2048
+
+checkpointer:
+  checkpoint_dir: /nfs-gpu/users_home/martin/couplednorm-output/model/Qwen/Qwen3-8B/
+  checkpoint_files: [model-00001-of-00005.safetensors, model-00002-of-00005.safetensors, model-00003-of-00005.safetensors, model-00004-of-00005.safetensors, model-00005-of-00005.safetensors]
+  model_type: QWEN3
+
+teacher_checkpointer:
+  checkpoint_dir: /nfs-gpu/users_home/martin/couplednorm-output/model/Qwen/Qwen3-8B/
+  checkpoint_files: [model-00001-of-00005.safetensors, model-00002-of-00005.safetensors, model-00003-of-00005.safetensors, model-00004-of-00005.safetensors, model-00005-of-00005.safetensors]
+  model_type: QWEN3
+
+optimizer:
+  lr: 1e-5
+
+batch_size: 1
+gradient_accumulation_steps: 32
+
+eval:
+  batch_size: 1
+
+eval_every_n_steps: 4000
+
+enable_activation_checkpointing: True
+enable_activation_offloading: False

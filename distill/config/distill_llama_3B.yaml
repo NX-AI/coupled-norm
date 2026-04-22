@@ -28,6 +28,9 @@ teacher_checkpointer:
 optimizer:
   lr: 1e-5
 
+eval:
+  batch_size: 4
+
 batch_size: 8
 gradient_accumulation_steps: 4
 
