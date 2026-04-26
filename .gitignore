@@ -9,6 +9,7 @@ distill/output
 distill/outputs
 distill/ckpt
 *.out
+*.png
 hf
 wandb
 tea_debug.log
