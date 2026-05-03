@@ -8,4 +8,5 @@ tag: decode-plot-normal-0.25
 
 new_token_count: 256
 autorange_min_run_time: 30
-sleep: 4
+sleep: 0
+warmup: 2
