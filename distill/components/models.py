@@ -171,7 +171,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         h, attn_scaler = self.sa_norm(x, return_scaler=True)
         attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
 
-        # fix_scalers = [0.845, 0.817, 0.857, 0.892, 0.93, 0.933, 0.939, 0.916, 0.923, 0.875, 0.971, 0.907, 0.915, 0.91, 0.871, 0.925]
 
         # print(self.norm_normal_before, self.norm_normal_after, self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after)
         if (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):

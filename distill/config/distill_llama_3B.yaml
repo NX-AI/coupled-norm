@@ -7,9 +7,10 @@ defaults:
   - _self_
 
 model:
-  _component_: components.llama3_2_1B_coupled_rms.lora_llama3_2_3b 
-  norm_normal_before: 3
+  _component_: components.models.lora_llama3_2_3b 
+  norm_normal_before: 0
   norm_normal_after: 100
+  coupled_init_downscale: 0.9174312 # alpha = 1.09
 
 teacher_model:
   _component_: torchtune.models.llama3_2.llama3_2_3b
@@ -31,7 +32,7 @@ optimizer:
 eval:
   batch_size: 4
 
-batch_size: 8
-gradient_accumulation_steps: 4
+batch_size: 2
+gradient_accumulation_steps: 16
 
 enable_activation_checkpointing: True

@@ -8,9 +8,9 @@ defaults:
 
 model:
   _component_: components.models.lora_qwen3_8b_instruct
-  norm_normal_before: 6 # 1/4 of 28 layers
+  norm_normal_before: 0
   norm_normal_after: 100
-  coupled_init_downscale: 0.92
+  coupled_init_downscale: 0.9174312 # alpha = 1.09
 
 teacher_model:
   _component_: torchtune.models.qwen3.qwen3_8b_instruct

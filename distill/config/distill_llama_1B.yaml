@@ -17,8 +17,6 @@ output_dir: ${hydra:runtime.output_dir}
 # Model Arguments
 model:
   _component_: components.models.lora_llama3_2_1b 
-  norm_normal_before: 3
-  norm_normal_after: 100
   # We only add lora to the MLP's
   lora_attn_modules: [] # ['q_proj', 'v_proj', 'output_proj']
   apply_lora_to_mlp: True
@@ -27,7 +25,9 @@ model:
   lora_alpha: 2048  # usually alpha=2*rank
   lora_dropout: 0.0
   use_dora: True
-  coupled_init_downscale: 0.91
+  norm_normal_before: 0
+  norm_normal_after: 100
+  coupled_init_downscale: 0.9174312 # alpha = 1.09
 
 teacher_model:
   _component_: torchtune.models.llama3_2.llama3_2_1b
@@ -63,7 +63,7 @@ optimizer:
   _component_: torch.optim.AdamW
   fused: True
   weight_decay: 0.0 # 0.01
-  lr: 1e-5
+  lr: 5e-5
 lr_scheduler:
   _component_: torchtune.training.lr_schedulers.get_cosine_schedule_with_warmup
   num_warmup_steps: 250
@@ -79,10 +79,10 @@ kd_ratio: 1.0
 seed: 67
 shuffle: True
 batch_size: 4
+gradient_accumulation_steps: 16  # Use to increase effective batch size
 
 epochs: 1
 max_steps_per_epoch: null
-gradient_accumulation_steps: 8  # Use to increase effective batch size
 clip_grad_norm: 1.0
 compile: True  # torch.compile the model + loss, True increases speed + decreases memory
 
@@ -97,7 +97,7 @@ eval:
     train: ["hellaswag", "mmlu"]
     end: ["hellaswag", "mmlu", "arc_challenge", "gpqa_main_zeroshot"]
   limit: null
-  batch_size: 8
+  batch_size: 4
   enable_kv_cache: True
   seed: 1234
 
