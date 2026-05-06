@@ -9,22 +9,7 @@ from pathlib import Path
 from transformers import pipeline
 import torch.utils.benchmark as benchmark
 from torch.profiler import profile, ProfilerActivity
-from rms_norm import patch_coupled_model_manual
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, weight=None, eps = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(weight if weight is not None else torch.ones(hidden_size,))
-        self.eps = eps
-
-    def forward(self, x, scaler=None, return_scaler=False):
-        input_dtype = x.dtype
-        if scaler is None:
-            var = x.to(torch.float32).pow(2).mean(dim=-1, keepdim=True) + self.eps
-            scaler = torch.rsqrt(var)
-
-        y = self.weight * (x * scaler).to(input_dtype)
-        return (y, scaler) if return_scaler else y
+from rms_norm import patch_coupled_model_hf, RMSNorm
 
 def patch_ref_model(model):
     for block in model.model.layers:
@@ -54,30 +39,34 @@ def performance_benchmark_model(cfg: DictConfig):
     if cfg.mode == "ref":
         patch_ref_model(pipe.model)
     elif cfg.mode == "coupled":
+        config = pipe.model.config
         if "qwen" in cfg.model_id.lower():
-            coupled_downscale = 0.92
-            norm_normal_before = 0
+            config.coupled_downscale = 0.92
+            config.no_coupled_before = 0
+            config.no_coupled_after = None
         elif "llama" in cfg.model_id.lower():
-            coupled_downscale = 0.91743
-            norm_normal_before = 3
+            config.coupled_downscale = 0.91743
+            config.no_coupled_before = 3
+            config.no_coupled_after = None
         else:
             raise Exception("No known model configuration!")
-        patch_coupled_model_manual(pipe.model, coupled_downscale, norm_normal_before, no_coupled_after=1000)
+        patch_coupled_model_hf(pipe.model, merged=cfg.merged, use_inplace_addmm=cfg.inplace_addmm)
     elif cfg.mode == "nonorm":
         patch_no_norm_model(pipe.model)
     else:
         raise Exception(f"No known mode {cfg.mode}")
 
-    pipe.model = torch.compile(pipe.model, mode="reduce-overhead")
+    pipe.model.generation_config.cache_implementation = "static"
+    pipe.model.forward = torch.compile(pipe.model.forward)
 
     prompts = [cfg.prompt for _ in range(cfg.batch_size)]
 
     for i in range(cfg.warmup):
-        pipe(prompts, max_new_tokens=cfg.new_token_count, min_new_tokens=cfg.new_token_count, batch_size=cfg.batch_size)
+        pipe(prompts, max_new_tokens=cfg.new_token_count, min_new_tokens=cfg.new_token_count, batch_size=cfg.batch_size, do_sample=False, eos_token_id=None, pad_token_id=None)
 
 
     timer = benchmark.Timer(
-        stmt='pipe(prompts, max_new_tokens=new_token_count, min_new_tokens=new_token_count, batch_size=batch_size)',
+        stmt='pipe(prompts, max_new_tokens=new_token_count, min_new_tokens=new_token_count, batch_size=batch_size, do_sample=False, eos_token_id=None, pad_token_id=None)',
         globals={'pipe': pipe, 'prompts': prompts, 'new_token_count': cfg.new_token_count, 'batch_size': cfg.batch_size},
         num_threads=num_threads
     )
@@ -99,14 +88,14 @@ def benchmark_model(cfg : DictConfig):
         **measurement_to_dict(measurement)
     }
 
-@hydra.main(version_base=None, config_path="config", config_name="config")
+@hydra.main(version_base=None, config_path="conf", config_name="config")
 def benchmark_app(cfg : DictConfig) -> None:
     print(OmegaConf.to_yaml(cfg))
 
     if (cfg.profile if "profile" in cfg else False):
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
             results = benchmark_model(cfg)
-        prof.export_chrome_trace("trace.json")
+        prof.export_chrome_trace(cfg.trace_name if "trace_name" in cfg else "trace.json")
     else:
         results = benchmark_model(cfg)
 
