@@ -7,7 +7,7 @@ defaults:
   - _self_
 
 model:
-  _component_: components.models.lora_llama3_2_3b 
+  _component_: components.models.lora_llama3_2_3b
   norm_normal_before: 0
   norm_normal_after: 100
   coupled_init_downscale: 0.9174312 # alpha = 1.09

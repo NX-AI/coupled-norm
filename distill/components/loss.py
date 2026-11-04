@@ -11,38 +11,48 @@ import torch.nn.functional as F
 
 
 class ForwardKLLoss(torch.nn.Module):
-    def __init__(self, ignore_index: int = -100, temperature: float = 1.0, normalize: bool = True):
+    def __init__(
+        self, ignore_index: int = -100, temperature: float = 1.0, normalize: bool = True
+    ):
         super().__init__()
         self.ignore_index = ignore_index
         self.temperature = temperature
         self.normalize = normalize
 
-    def forward(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
         student_logprob = F.log_softmax(student_logits / self.temperature, dim=-1)
         teacher_prob = F.softmax(teacher_logits / self.temperature, dim=-1)
-        kl_pointwise = F.kl_div(student_logprob, teacher_prob, reduction='none').sum(dim=-1)
+        kl_pointwise = F.kl_div(student_logprob, teacher_prob, reduction="none").sum(
+            dim=-1
+        )
 
         mask = (labels.view(-1) != self.ignore_index).float()
         masked_kl = kl_pointwise.view(-1) * mask
 
         loss_sum = masked_kl.sum()
-        scaled_loss = loss_sum * (self.temperature ** 2)
+        scaled_loss = loss_sum * (self.temperature**2)
 
         total_tokens = mask.sum()
         if total_tokens == 0:
-            return torch.tensor(0.0, device=student_logits.device, dtype=student_logits.dtype)
-            
+            return torch.tensor(
+                0.0, device=student_logits.device, dtype=student_logits.dtype
+            )
+
         return scaled_loss / total_tokens if self.normalize else scaled_loss
 
 
 class CELoss(torch.nn.Module):
-
     def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100):
         super().__init__()
         self.num_output_chunks = num_output_chunks
         self.ignore_index = ignore_index
 
-    def forward(self, logits: List[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
+    def forward(self, logits: list[torch.Tensor], labels: torch.Tensor) -> torch.Tensor:
         return F.cross_entropy(logits.float(), labels, ignore_index=self.ignore_index)
 
 
@@ -66,7 +76,7 @@ class ForwardKLLossOld(torch.nn.Module):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         labels: torch.Tensor,
-        normalize: bool = True
+        normalize: bool = True,
     ) -> torch.Tensor:
         teacher_prob = F.softmax(teacher_logits, dim=-1, dtype=torch.float32)
         teacher_logprob = F.log_softmax(teacher_logits, dim=-1, dtype=torch.float32)
@@ -78,7 +88,8 @@ class ForwardKLLossOld(torch.nn.Module):
         loss_sum = torch.sum(x * mask.view(-1), dim=0)
 
         sum_masks = torch.sum(mask.view(-1), dim=0)
-        if sum_masks == 0: return torch.tensor(0.0, device=x.device, dtype=torch.float32)
+        if sum_masks == 0:
+            return torch.tensor(0.0, device=x.device, dtype=torch.float32)
         return loss_sum / sum_masks if normalize else loss_sum
 
 
@@ -101,7 +112,12 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
             Default: -100
     """
 
-    def __init__(self, num_output_chunks: int = 8, ignore_index: int = -100, temperature: float = 1.0):
+    def __init__(
+        self,
+        num_output_chunks: int = 8,
+        ignore_index: int = -100,
+        temperature: float = 1.0,
+    ):
         super().__init__()
         self.num_output_chunks = num_output_chunks
         self.ignore_index = ignore_index
@@ -110,8 +126,8 @@ class ForwardKLWithChunkedOutputLoss(torch.nn.Module):
 
     def forward(
         self,
-        student_logits: List[torch.Tensor],
-        teacher_logits: List[torch.Tensor],
+        student_logits: list[torch.Tensor],
+        teacher_logits: list[torch.Tensor],
         labels: torch.Tensor,
     ) -> torch.Tensor:
         """

@@ -16,7 +16,7 @@ output_dir: ${hydra:runtime.output_dir}
 
 # Model Arguments
 model:
-  _component_: components.models.lora_llama3_2_1b 
+  _component_: components.models.lora_llama3_2_1b
   # We only add lora to the MLP's
   lora_attn_modules: [] # ['q_proj', 'v_proj', 'output_proj']
   apply_lora_to_mlp: True

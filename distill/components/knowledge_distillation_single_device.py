@@ -6,29 +6,29 @@
 
 import sys
 import time
-
 from functools import partial
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from warnings import warn
 
+import hydra
 import torch
 import torchtune.modules.common_utils as common_utils
-
-import hydra
+from lm_eval.evaluator import evaluate
+from lm_eval.models.hf_vlms import HFMultimodalLM
+from lm_eval.models.huggingface import HFLM
+from lm_eval.tasks import TaskManager, get_task_dict
+from lm_eval.utils import make_table
 from omegaconf import DictConfig, ListConfig, OmegaConf
-
 from torch import nn
 from torch.optim import Optimizer
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from torchtune import config, modules, training, utils
-from torchtune.data import padded_collate_packed, padded_collate_sft
+from torchtune.data import left_pad_sequence, padded_collate_packed, padded_collate_sft
 from torchtune.datasets import ConcatDataset
-from torchtune.data import left_pad_sequence
 from torchtune.generation import generate
 from torchtune.modules import TransformerDecoder
 from torchtune.modules.common_utils import local_kv_cache
-from torchtune.modules.transforms.tokenizers import ModelTokenizer
 from torchtune.modules.peft import (
     get_adapter_params,
     get_adapter_state_dict,
@@ -37,19 +37,13 @@ from torchtune.modules.peft import (
     set_trainable_params,
     validate_missing_and_unexpected_for_lora,
 )
+from torchtune.modules.transforms.tokenizers import ModelTokenizer
 from torchtune.recipe_interfaces import FTRecipeInterface
-from torchtune.training import DummyProfiler, PROFILER_KEY
-
-from lm_eval.evaluator import evaluate
-from lm_eval.models.hf_vlms import HFMultimodalLM
-from lm_eval.models.huggingface import HFLM
-from lm_eval.tasks import get_task_dict, TaskManager
-from lm_eval.utils import make_table
-from omegaconf import DictConfig
-
+from torchtune.training import PROFILER_KEY, DummyProfiler
 from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
+
 
 class _LLMEvalWrapper(HFLM):
     """An EvalWrapper for EleutherAI's eval harness based on gpt-fast's
@@ -117,7 +111,7 @@ class _LLMEvalWrapper(HFLM):
     def enable_kv_cache(self):
         return self._enable_kv_cache
 
-    def tok_encode(self, text: str, **kwargs) -> List[int]:
+    def tok_encode(self, text: str, **kwargs) -> list[int]:
         # Note on add_bos flag: setting to False as this gives better results, for example
         # +1% on truthfulqa_mc2 with a LoRA finetune. lit-gpt also sets this to False,
         # see https://github.com/Lightning-AI/lit-gpt/blob/main/eval/lm_eval_harness.py#L66,
@@ -126,8 +120,8 @@ class _LLMEvalWrapper(HFLM):
         return self._tokenizer.encode(text=text, add_bos=False, add_eos=False)
 
     def tok_batch_encode(
-        self, text: List[str], left_truncate_len: int = None, **kwargs
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, text: list[str], left_truncate_len: int = None, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         tokenized_text = [self.tok_encode(x) for x in text]
 
         # pad left
@@ -144,7 +138,7 @@ class _LLMEvalWrapper(HFLM):
 
         return x, torch.ones_like(x)  # return 'mask' b/c it's expected by the harness
 
-    def tok_decode(self, tokens: Union[List[int], int], **kwargs) -> str:
+    def tok_decode(self, tokens: list[int] | int, **kwargs) -> str:
         if isinstance(tokens, int):
             tokens = [tokens]
         return self._tokenizer.decode(tokens)
@@ -181,7 +175,6 @@ class _LLMEvalWrapper(HFLM):
             dtype=self._dtype,
             decoder_max_seq_len=self.max_length,
         ):
-
             toks, _ = generate(
                 self.model,
                 maybe_padded_context,
@@ -192,7 +185,6 @@ class _LLMEvalWrapper(HFLM):
                 stop_tokens=self._tokenizer.stop_tokens,
             )
         return toks[:bsz]
-
 
 
 class KDRecipeSingleDevice(FTRecipeInterface):
@@ -300,7 +292,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         self._clip_grad_norm = cfg.get("clip_grad_norm", None)
         self._kd_ratio = cfg.get("kd_ratio", 0.5)
 
-    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
+    def load_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
         """
         Extract the checkpoint state from file and validate. This includes the
         base model weights. If resume_from_checkpoint is True, this also includes
@@ -322,7 +314,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             self._update_recipe_state(checkpoint_dict)
         return checkpoint_dict
 
-    def load_teacher_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
+    def load_teacher_checkpoint(self, cfg_checkpointer: DictConfig) -> dict[str, Any]:
         """
         Extract the teacher checkpoint state from file.
         """
@@ -332,7 +324,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         checkpoint_dict = teacher_checkpointer.load_checkpoint()
         return checkpoint_dict
 
-    def _update_recipe_state(self, ckpt_dict: Dict[str, Any]) -> None:
+    def _update_recipe_state(self, ckpt_dict: dict[str, Any]) -> None:
         """
         Updates the recipe state from checkpoint.
         """
@@ -500,7 +492,6 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             (cfg.batch_size, 1), self._loss_fn.ignore_index, device=self._device
         )
 
-
         self.limit = cfg.eval.limit
         self.batch_size = cfg.eval.batch_size
         self.enable_kv_cache = cfg.eval.get("enable_kv_cache", True)
@@ -518,10 +509,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
 
         self._train_eval_tasks = cfg.eval.tasks.train
 
-
     def _setup_profiler(
-        self, cfg_profiler: Optional[DictConfig] = None
-    ) -> Union[torch.profiler.profile, DummyProfiler]:
+        self, cfg_profiler: DictConfig | None = None
+    ) -> torch.profiler.profile | DummyProfiler:
         """
         Parses the `profiler` section of top-level `cfg` and sets up profiler
 
@@ -572,7 +562,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             assert (
                 cfg_profiler.get("_component_")
                 == "torchtune.training.setup_torch_profiler"
-            ), "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+            ), (
+                "Only torch profiler supported currently: component must be `torchtune.training.setup_torch_profiler`"
+            )
 
         profiler, profiler_cfg = config.instantiate(cfg_profiler)
 
@@ -591,8 +583,8 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         cfg_model: DictConfig,
         enable_activation_checkpointing: bool,
         compile_model: bool,
-        base_model_state_dict: Dict[str, Any],
-        lora_weights_state_dict: Optional[Dict[str, Any]] = None,
+        base_model_state_dict: dict[str, Any],
+        lora_weights_state_dict: dict[str, Any] | None = None,
     ) -> nn.Module:
         with training.set_default_dtype(self._dtype), self._device:
             model = config.instantiate(cfg_model)
@@ -672,7 +664,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
     def _setup_teacher_model(
         self,
         model_cfg: DictConfig,
-        model_state_dict: Dict[str, Any],
+        model_state_dict: dict[str, Any],
     ) -> nn.Module:
         with training.set_default_dtype(self._dtype), self._device:
             model = config.instantiate(model_cfg)
@@ -699,9 +691,8 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         return model
 
     def _setup_optimizer(
-        self, cfg_optimizer: DictConfig, opt_state_dict: Optional[Dict[str, Any]] = None
+        self, cfg_optimizer: DictConfig, opt_state_dict: dict[str, Any] | None = None
     ) -> Optimizer:
-
         """
         scaler_params = []
         other_params = []
@@ -714,14 +705,14 @@ class KDRecipeSingleDevice(FTRecipeInterface):
                 else:
                     other_params.append(param)
 
-    
+
         parameter_groups = [
             {"params": scaler_params, "lr": 1e-3},
             {"params": other_params}
         ]
         """
         # TODO: Unused:
-        parameter_groups = self._model.parameters() 
+        parameter_groups = self._model.parameters()
 
         optimizer = config.instantiate(cfg_optimizer, parameter_groups)
         if opt_state_dict:
@@ -751,7 +742,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         cfg_dataset: DictConfig,
         shuffle: bool,
         batch_size: int,
-        dataloader_state_dict: Optional[Dict[str, Any]] = None,
+        dataloader_state_dict: dict[str, Any] | None = None,
     ) -> StatefulDataLoader:
         """
         All data related setup happens here. This recipe currently supports only
@@ -847,7 +838,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             "peft_type": "LORA",
             "no_coupled_before": self.no_coupled_before,
             "no_coupled_after": self.no_coupled_after,
-            "coupled_downscale": self.coupled_downscale
+            "coupled_downscale": self.coupled_downscale,
         }
         ckpt_dict.update({training.ADAPTER_CONFIG: adapter_config})
 
@@ -859,7 +850,7 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         )
 
     def _loss_step(
-        self, batch: Dict[str, torch.Tensor]
+        self, batch: dict[str, torch.Tensor]
     ) -> (torch.Tensor, torch.Tensor):
 
         # Both are shape [b, s]
@@ -922,7 +913,6 @@ class KDRecipeSingleDevice(FTRecipeInterface):
             pbar = tqdm(total=self._steps_per_epoch)
             self._dataloader.sampler.set_epoch(curr_epoch)
             for idx, batch in enumerate(self._dataloader):
-
                 # Start tracking CUDA memory for active steps for just the first epoch
                 if (
                     curr_epoch == 0
@@ -1034,9 +1024,12 @@ class KDRecipeSingleDevice(FTRecipeInterface):
     def cleanup(self) -> None:
         self._metric_logger.close()
 
-    def evaluate(self, tasks: list[str], log_prefix: str, seed: int | None = None) -> None:
+    def evaluate(
+        self, tasks: list[str], log_prefix: str, seed: int | None = None
+    ) -> None:
         tasks = list(tasks)
-        if len(tasks) == 0: return {}
+        if len(tasks) == 0:
+            return {}
 
         if seed is not None:
             training.set_seed(seed=seed)
@@ -1048,7 +1041,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
 
         t0 = time.time()
         log.info(f"Running evaluation on the following tasks: {tasks}")
-        output = evaluate(self.eleuther_model_wrapper, self.eval_task_dict, limit=self.limit)
+        output = evaluate(
+            self.eleuther_model_wrapper, self.eval_task_dict, limit=self.limit
+        )
         t1 = time.time() - t0
 
         log.info(f"Eval completed in {t1:.02f} seconds.")
@@ -1060,9 +1055,9 @@ class KDRecipeSingleDevice(FTRecipeInterface):
         for task, metrics in output["results"].items():
             for metric_name, value in metrics.items():
                 if not "stderr" in metric_name and not "norm" in metric_name:
-                    matric = metric_name.replace(',none', '')
+                    matric = metric_name.replace(",none", "")
                     wandb_log[f"{log_prefix}/{task}/{matric}"] = value
-        
+
         self._metric_logger.log_dict(wandb_log, step=self.global_step)
 
         return output["results"]

@@ -16,23 +16,25 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-from typing import Dict, List, Optional, Any
 from functools import partial
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-
 from torchtune.models.llama3._model_utils import scale_hidden_dim_for_mlp
 from torchtune.models.llama3_1._position_embeddings import Llama3ScaledRoPE
-from torchtune.modules import TiedLinear
-from torchtune.modules import MultiHeadAttention, TransformerDecoder
-from torchtune.modules import MultiHeadAttention
-from torchtune.models.llama3_2._component_builders import lora_llama3_2_self_attention, llama3_mlp # , lora_llama3_mlp
-from torchtune.modules import TransformerDecoder
-from torchtune.modules.peft import LORA_ATTN_MODULES
+from torchtune.models.llama3_2._component_builders import (  # , lora_llama3_mlp
+    llama3_mlp,
+    lora_llama3_2_self_attention,
+)
+from torchtune.modules import (
+    FeedForward,
+    MultiHeadAttention,
+    TiedLinear,
+    TransformerDecoder,
+)
 from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
-from torchtune.modules import FeedForward
-from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
+from torchtune.modules.peft import LORA_ATTN_MODULES, DoRALinear, LoRALinear
 
 
 def setup_caches(
@@ -40,8 +42,8 @@ def setup_caches(
     batch_size: int,
     dtype: torch.dtype,
     *,
-    encoder_max_seq_len: Optional[int] = None,
-    decoder_max_seq_len: Optional[int] = None,
+    encoder_max_seq_len: int | None = None,
+    decoder_max_seq_len: int | None = None,
 ):
     has_decoder_layers = True
     if has_decoder_layers:
@@ -56,11 +58,20 @@ def setup_caches(
             encoder_max_seq_len=self.encoder_max_cache_seq_len,
             decoder_max_seq_len=self.decoder_max_cache_seq_len,
         )
+
+
 # Mokey patch, because original implementaion checks for class that we've redefined
 TransformerDecoder.setup_caches = setup_caches
 
+
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, unfreeze = True, coupled_downscale: float | None = None) -> None:
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        unfreeze=True,
+        coupled_downscale: float | None = None,
+    ) -> None:
         super().__init__()
         self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
@@ -76,8 +87,9 @@ class RMSNorm(nn.Module):
         return (y, scaler) if return_scaler else y
 
     # Make RMSNorm weight learnable
-    def adapter_params(self) -> List[str]:
-        if not self.unfreeze: return []
+    def adapter_params(self) -> list[str]:
+        if not self.unfreeze:
+            return []
         adapter_params = ["scale"]
         return adapter_params
 
@@ -101,10 +113,10 @@ class TransformerSelfAttentionLayer(nn.Module):
         attn: MultiHeadAttention,
         mlp: nn.Module,
         *,
-        sa_norm: Optional[nn.Module] = None,
-        mlp_norm: Optional[nn.Module] = None,
-        sa_scale: Optional[nn.Module] = None,
-        mlp_scale: Optional[nn.Module] = None,
+        sa_norm: nn.Module | None = None,
+        mlp_norm: nn.Module | None = None,
+        sa_scale: nn.Module | None = None,
+        mlp_scale: nn.Module | None = None,
         norm_normal_before: int | None = None,
         norm_normal_after: int | None = None,
         coupled_init_downscale: float = 0.9,
@@ -161,9 +173,9 @@ class TransformerSelfAttentionLayer(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        mask: Optional[Any] = None,
-        input_pos: Optional[torch.Tensor] = None,
-        **kwargs: Dict,
+        mask: Any | None = None,
+        input_pos: torch.Tensor | None = None,
+        **kwargs: dict,
     ) -> torch.Tensor:
         # Input tensor and attention output have the same shape
         # [b, s, d]
@@ -171,9 +183,8 @@ class TransformerSelfAttentionLayer(nn.Module):
         h, attn_scaler = self.sa_norm(x, return_scaler=True)
         attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
 
-
         # print(self.norm_normal_before, self.norm_normal_after, self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after)
-        if (self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after):
+        if self.idx <= self.norm_normal_before or self.idx >= self.norm_normal_after:
             attn_scaler = None
         else:
             attn_scaler = attn_scaler * self.coupled_init_downscale
@@ -189,6 +200,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         out = h + self.mlp_scale(mlp_out)
         return out
+
 
 def lora_llama3_mlp(
     *,
@@ -239,14 +251,13 @@ def lora_llama3_mlp(
     )
 
 
-
 class FeedForwardFineuneUp(nn.Module):
     def __init__(
         self,
         *,
         gate_proj: nn.Module,
         down_proj: nn.Module,
-        up_proj: Optional[nn.Module] = None,
+        up_proj: nn.Module | None = None,
         activation: nn.Module = nn.SiLU(),
     ):
         super().__init__()
@@ -262,18 +273,23 @@ class FeedForwardFineuneUp(nn.Module):
         h = self.w2(h)
         return h
 
-    def adapter_params(self) -> List[str]:
-        return ["w1.weight", "w2.weight", "w3.weight"] # 
+    def adapter_params(self) -> list[str]:
+        return ["w1.weight", "w2.weight", "w3.weight"]  #
 
-def llama3_mlp_finetune(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedForward:
+
+def llama3_mlp_finetune(
+    dim: int, hidden_dim: int, quantize_base: bool = False
+) -> FeedForward:
     gate_proj = nn.Linear(dim, hidden_dim, bias=False)
     down_proj = nn.Linear(hidden_dim, dim, bias=False)
     up_proj = nn.Linear(dim, hidden_dim, bias=False)
-    return FeedForwardFineuneUp(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
+    return FeedForwardFineuneUp(
+        gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj
+    )
 
 
 def lora_llama3_2(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     *,
@@ -284,7 +300,7 @@ def lora_llama3_2(
     num_kv_heads: int,
     embed_dim: int,
     max_seq_len: int,
-    intermediate_dim: Optional[int] = None,
+    intermediate_dim: int | None = None,
     attn_dropout: float = 0.0,
     norm_eps: float = 1e-5,
     rope_base: int = 500_000,
@@ -301,10 +317,14 @@ def lora_llama3_2(
     norm_normal_after: int | None = None,
     coupled_init_downscale: float = 0.9,
 ) -> TransformerDecoder:
-    hidden_dim = intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
+    hidden_dim = (
+        intermediate_dim if intermediate_dim else scale_hidden_dim_for_mlp(embed_dim)
+    )
     head_dim = embed_dim // num_heads
-    rope = Llama3ScaledRoPE(dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor)
-    
+    rope = Llama3ScaledRoPE(
+        dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor
+    )
+
     layers = nn.ModuleList()
     for i in range(num_layers):
         if len(lora_attn_modules) > 0:
@@ -350,15 +370,21 @@ def lora_llama3_2(
             )
             # mlp = llama3_mlp_finetune(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
         else:
-            mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base)
-
+            mlp = llama3_mlp(
+                dim=embed_dim, hidden_dim=hidden_dim, quantize_base=quantize_base
+            )
 
         layer = TransformerSelfAttentionLayer(
             idx=i,
             attn=self_attn,
             mlp=mlp,
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after, coupled_downscale=coupled_init_downscale),
+            mlp_norm=RMSNorm(
+                dim=embed_dim,
+                eps=norm_eps,
+                unfreeze=i > norm_normal_before and i < norm_normal_after,
+                coupled_downscale=coupled_init_downscale,
+            ),
             norm_normal_before=norm_normal_before,
             norm_normal_after=norm_normal_after,
             coupled_init_downscale=coupled_init_downscale,
@@ -376,7 +402,7 @@ def lora_llama3_2(
         output_proj = TiedLinear(tok_embeddings)
     else:
         output_proj = nn.Linear(embed_dim, vocab_size, bias=False)
-        
+
     model = TransformerDecoder(
         tok_embeddings=tok_embeddings,
         layers=layers,
@@ -396,8 +422,9 @@ def lora_llama3_2(
 
     return model
 
+
 def lora_llama3_2_1b(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
@@ -436,8 +463,9 @@ def lora_llama3_2_1b(
         coupled_init_downscale=coupled_init_downscale,
     )
 
+
 def lora_llama3_2_3b(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
@@ -477,24 +505,24 @@ def lora_llama3_2_3b(
     )
 
 
+from functools import partial
 from typing import List, Optional
 
-from torchtune.models.qwen3._component_builders import lora_qwen3, lora_qwen3_mlp, qwen3_mlp
-from torchtune.modules import TransformerDecoder
-from torchtune.modules.peft import LORA_ATTN_MODULES
-
-from functools import partial
-from typing import Optional
-from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
-
 from torch import nn
-from torchtune.modules.transformer import TransformerDecoder
-from torchtune.models.qwen2._positional_embeddings import Qwen2RotaryPositionalEmbeddings
+from torchtune.models.qwen2._positional_embeddings import (
+    Qwen2RotaryPositionalEmbeddings,
+)
 from torchtune.models.qwen3._attention import Qwen3Attention
-from torchtune.modules import FeedForward, TiedLinear
-from torchtune.modules.peft import DoRALinear, LORA_ATTN_MODULES, LoRALinear
+from torchtune.models.qwen3._component_builders import (
+    lora_qwen3,
+    lora_qwen3_mlp,
+    qwen3_mlp,
+)
+from torchtune.modules import FeedForward, TiedLinear, TransformerDecoder
 from torchtune.modules import RMSNorm as RMSNormNormal
-
+from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
+from torchtune.modules.peft import LORA_ATTN_MODULES, DoRALinear, LoRALinear
+from torchtune.modules.transformer import TransformerDecoder
 
 
 def lora_qwen3(
@@ -510,7 +538,7 @@ def lora_qwen3(
     embed_dim: int,
     intermediate_dim: int,
     max_seq_len: int,
-    head_dim: Optional[int] = None,
+    head_dim: int | None = None,
     attn_dropout: float = 0.0,
     norm_eps: float = 1e-5,
     rope_base: float = 1_000_000.0,
@@ -534,7 +562,9 @@ def lora_qwen3(
     head_dim = head_dim or embed_dim // num_heads
     num_kv_heads = num_kv_heads if num_kv_heads else num_heads
 
-    rope = Qwen2RotaryPositionalEmbeddings(dim=head_dim, max_seq_len=max_seq_len, base=rope_base)
+    rope = Qwen2RotaryPositionalEmbeddings(
+        dim=head_dim, max_seq_len=max_seq_len, base=rope_base
+    )
 
     layers = nn.ModuleList()
     for i in range(num_layers):
@@ -548,7 +578,9 @@ def lora_qwen3(
             v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=v_proj_bias),
             output_proj=nn.Linear(num_heads * head_dim, embed_dim, bias=False),
             pos_embeddings=rope,
-            q_norm=RMSNormNormal(dim=head_dim, eps=norm_eps) if q_norm else None, # norm on head_dim
+            q_norm=RMSNormNormal(dim=head_dim, eps=norm_eps)
+            if q_norm
+            else None,  # norm on head_dim
             k_norm=RMSNormNormal(dim=head_dim, eps=norm_eps) if k_norm else None,
             kv_cache=None,
             max_seq_len=max_seq_len,
@@ -573,7 +605,12 @@ def lora_qwen3(
             attn=self_attn,
             mlp=mlp,
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=False),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps, unfreeze=i > norm_normal_before and i < norm_normal_after, coupled_downscale=coupled_init_downscale),
+            mlp_norm=RMSNorm(
+                dim=embed_dim,
+                eps=norm_eps,
+                unfreeze=i > norm_normal_before and i < norm_normal_after,
+                coupled_downscale=coupled_init_downscale,
+            ),
             norm_normal_before=norm_normal_before,
             norm_normal_after=norm_normal_after,
             coupled_init_downscale=coupled_init_downscale,
@@ -593,7 +630,13 @@ def lora_qwen3(
         # TODO: quantize_base is not applied to final output_proj currently.
         adapter_cls = DoRALinear if use_dora else LoRALinear
         output_proj = (
-            adapter_cls(embed_dim, vocab_size, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+            adapter_cls(
+                embed_dim,
+                vocab_size,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
             if apply_lora_to_output
             else nn.Linear(embed_dim, vocab_size, bias=False)
         )
@@ -624,7 +667,7 @@ def lora_qwen3(
 
 
 def lora_qwen3_0_6b_instruct(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
@@ -667,8 +710,9 @@ def lora_qwen3_0_6b_instruct(
         coupled_init_downscale=coupled_init_downscale,
     )
 
+
 def lora_qwen3_1_7b_instruct(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
@@ -711,8 +755,9 @@ def lora_qwen3_1_7b_instruct(
         coupled_init_downscale=coupled_init_downscale,
     )
 
+
 def lora_qwen3_4b_instruct(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
@@ -755,8 +800,9 @@ def lora_qwen3_4b_instruct(
         coupled_init_downscale=coupled_init_downscale,
     )
 
+
 def lora_qwen3_8b_instruct(
-    lora_attn_modules: List[LORA_ATTN_MODULES],
+    lora_attn_modules: list[LORA_ATTN_MODULES],
     apply_lora_to_mlp: bool = False,
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
