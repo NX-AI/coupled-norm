@@ -1,6 +1,9 @@
 # coupled-rms-norm
 
+[![Paper](https://img.shields.io/static/v1?label=Paper&message=OpenReview&color=8C1B13)](https://openreview.net/forum?id=DnPhmFIanE)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
+This repository contains the code for CoupledNorm, introduced in the paper [CoupledNorm: Efficient Normalization via Shared RMS Statistics](https://openreview.net/forum?id=DnPhmFIanE), presented at the ICML 2026 Workshop AdaptFM.
 
 Dependencies:
 `pip install torch transformers hydra-core pandas`
@@ -27,6 +30,20 @@ Papers:
 - Transformers without Normalization: https://arxiv.org/pdf/2503.10622
 - Stronger Normalization-Free Transformers: https://arxiv.org/pdf/2512.10938
 - SiameseNorm: Breaking the Barrier to Reconciling Pre/Post-Norm: https://arxiv.org/abs/2602.08064
+
+## Cite
+
+If you use CoupledNorm in your research, please cite our work:
+
+```bibtex
+@inproceedings{loretz2026couplednorm,
+      title={CoupledNorm: Efficient Normalization via Shared {RMS} Statistics},
+      author={Martin Loretz and Sepp Hochreiter},
+      booktitle={ICML 2026 Workshop AdaptFM},
+      year={2026},
+      url={https://openreview.net/forum?id=DnPhmFIanE},
+}
+```
 
 ## License
 
