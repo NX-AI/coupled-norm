@@ -1,5 +1,7 @@
 # coupled-rms-norm
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
+
 Dependencies:
 `pip install torch transformers hydra-core pandas`
 
@@ -25,3 +27,7 @@ Papers:
 - Transformers without Normalization: https://arxiv.org/pdf/2503.10622
 - Stronger Normalization-Free Transformers: https://arxiv.org/pdf/2512.10938
 - SiameseNorm: Breaking the Barrier to Reconciling Pre/Post-Norm: https://arxiv.org/abs/2602.08064
+
+## License
+
+coupled-rms-norm is licensed under the [Apache License 2.0](./LICENSE).
