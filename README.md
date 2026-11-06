@@ -39,7 +39,7 @@ If you use CoupledNorm in your research, please cite our work:
 @inproceedings{loretz2026couplednorm,
       title={CoupledNorm: Efficient Normalization via Shared {RMS} Statistics},
       author={Martin Loretz and Sepp Hochreiter},
-      booktitle={ICML 2026 Workshop AdaptFM},
+      booktitle={ICML 2026 Workshop on Resource-Adaptive Foundation Model Inference (AdaptFM)},
       year={2026},
       url={https://openreview.net/forum?id=DnPhmFIanE},
 }
